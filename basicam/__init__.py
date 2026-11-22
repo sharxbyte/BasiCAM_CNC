@@ -1,0 +1,1 @@
+"""BasiCAM CNC desktop application."""

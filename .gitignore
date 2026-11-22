@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+OLD_WORKING
+.codemap/
+helpers/
+
+# Roadmap test programs (local only)
+tests/gui_helpers.py
+tests/test_safety.py
+tests/test_roadmap.py
