@@ -16,6 +16,10 @@ class GrblStatus:
     feed_rate: float | None = None
     spindle_rpm: float | None = None
     work_offset: tuple[float, float, float] | None = None  # WCO (sent only every few reports)
+    axis_values: tuple[tuple[str, float], ...] = ()  # every MPos axis by name (X Y Z A B C U V)
+
+    def axis(self, name: str) -> float | None:
+        return dict(self.axis_values).get(name)
 
 
 @dataclass(frozen=True)
@@ -29,9 +33,12 @@ def available_serial_ports() -> list[tuple[str, str]]:
     return [(port.device, port.description or port.device) for port in list_ports.comports()]
 
 
-def parse_grbl_status(line: str) -> GrblStatus | None:
+def parse_grbl_status(line: str, axis_names: str = "XYZABC") -> GrblStatus | None:
+    """GRBL / grblHAL / FluidNC status report. MPos may carry more than three axes; they are
+    named in ``axis_names`` order (from $I [AXS:...] or the machine profile)."""
     if not (line.startswith("<") and line.endswith(">")):
         return None
+    axis_values: tuple[tuple[str, float], ...] = ()
     fields = line[1:-1].split("|")
     state = fields[0]
     machine_position = None
@@ -46,6 +53,8 @@ def parse_grbl_status(line: str) -> GrblStatus | None:
             continue
         if key == "MPos":
             machine_position = _parse_xyz(value)
+            numbers = [_parse_float(v) for v in value.split(",")]
+            axis_values = tuple((n, v) for n, v in zip(axis_names, numbers) if v is not None)
         elif key == "WPos":
             work_position = _parse_xyz(value)
         elif key == "WCO":
@@ -57,7 +66,7 @@ def parse_grbl_status(line: str) -> GrblStatus | None:
             if len(values) >= 2:
                 feed_rate = _parse_float(values[0])
                 spindle_rpm = _parse_float(values[1])
-    return GrblStatus(state, machine_position, work_position, pins, feed_rate, spindle_rpm, work_offset)
+    return GrblStatus(state, machine_position, work_position, pins, feed_rate, spindle_rpm, work_offset, axis_values)
 
 
 def parse_grbl_capabilities(lines: list[str]) -> GrblCapabilities | None:

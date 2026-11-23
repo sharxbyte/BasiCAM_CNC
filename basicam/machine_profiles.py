@@ -36,6 +36,19 @@ from PySide6.QtWidgets import (
 )
 
 from basicam.cam_envelope_stock_removal import MachineKinematicsProfile
+from basicam.auxiliaries import AuxOutput
+from basicam.bar_feed import BarFeed
+from basicam.rotary_devices import DEVICE_KINDS, MOUNTS, RotaryDevice
+from basicam.tool_changer import CHANGER_LABELS, ToolChanger, ToolTable
+from basicam.machine_types import (
+    CONTROLLERS,
+    LAYOUT_LABELS,
+    PROCESSES,
+    AxisSpec,
+    Head,
+    axis_problems,
+    default_axes,
+)
 from basicam.tooling import COLLET_GRIP_MM
 
 AXES = ("X", "Y", "Z")
@@ -144,6 +157,61 @@ class MachineProfile:
     soft_limits: dict[str, SoftLimit] = field(default_factory=lambda: {a: SoftLimit() for a in AXES})
     z_reference_tool: str = ""
     z_reference_stick_out_mm: float = 0.0
+    # v2 Block 10: process, kinematic layout, axes, heads (old machines load as a 3-axis mill)
+    process: str = "mill"
+    layout: str = "gantry3"
+    axes: list[AxisSpec] = field(default_factory=list)  # empty: derived from the layout and travel
+    heads: list[Head] = field(default_factory=list)
+    rotary_axis: str = "A"  # 4th axis: "A" (about X) or "B" (about Y)
+    tilt_axis: str = "A"  # trunnion tilt: "A" or "B"
+    rotary_centre_mm: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    pivot_length_mm: float = 0.0
+    diameter_mode: bool = True  # lathes: X reads the diameter
+    wire_height_mm: float = 50.0  # wire EDM guide spacing
+    # v2 Block 11: tool changer and the tool table (pocket -> tool)
+    tool_changer: ToolChanger = field(default_factory=ToolChanger)
+    tool_table: ToolTable = field(default_factory=ToolTable)
+    # v2 Block 12: auxiliary outputs (air, gas, coolant, fluid, water, vacuum, dust, fumes)
+    aux_outputs: list[AuxOutput] = field(default_factory=list)
+    # v2 Block 13: lasers with fast beam gating (shutter / fly cut) may flash-cut rows of features
+    fast_beam_gating: bool = False
+    gate_method: str = "M4 S0"  # "shutter", "fast PWM / gate" or "M4 S0" between features
+    min_gate_s: float = 0.002
+    # v2 Block 14: rotary devices (one active)
+    rotary_devices: list[RotaryDevice] = field(default_factory=list)
+    active_rotary: int = 0
+    bar_feed: BarFeed = field(default_factory=BarFeed)  # v2 Block 22
+
+    def rotary_device(self) -> RotaryDevice | None:
+        if not self.rotary_devices:
+            return None
+        return self.rotary_devices[min(max(self.active_rotary, 0), len(self.rotary_devices) - 1)]
+
+    def aux_output_list(self) -> list[AuxOutput]:
+        """Configured auxiliaries; unconfigured machines get only the standard GRBL coolant
+        outputs (M7 / M8), plus air assist on M8 for lasers."""
+        if self.aux_outputs:
+            return list(self.aux_outputs)
+        outputs = [AuxOutput("flood"), AuxOutput("mist")]
+        if self.process in ("laser", "rotary_laser", "laser_lathe"):
+            outputs.append(AuxOutput("air_assist"))
+        return outputs
+
+    def axis_specs(self) -> list[AxisSpec]:
+        if self.axes:
+            return list(self.axes)
+        axes = default_axes(self.layout, self.travel_mm, self.homing_direction)
+        if self.layout == "gantry3_rotary" and self.rotary_axis == "B":
+            axes[-1].name = "B"
+        if self.layout == "table_table5" and self.tilt_axis == "B":
+            axes[3].name = "B"
+        return axes
+
+    def axis_names(self) -> list[str]:
+        return [a.name for a in self.axis_specs()]
+
+    def controller_problems(self) -> list[str]:
+        return axis_problems(self.axis_specs(), self.controller)
 
     # ---------------------------------------------------------------- limits
     def hard_bounds(self, axis: str) -> tuple[float, float]:
@@ -186,6 +254,10 @@ class MachineProfile:
         data = asdict(self)
         data["keep_out_zones"] = [asdict(z) for z in self.keep_out_zones]
         data["soft_limits"] = {a: asdict(l) for a, l in self.soft_limits.items()}
+        data["tool_changer"] = asdict(self.tool_changer)
+        data["tool_table"] = self.tool_table.to_dict()
+        data["rotary_devices"] = [r.to_dict() for r in self.rotary_devices]
+        data["bar_feed"] = self.bar_feed.to_dict()
         return data
 
     @classmethod
@@ -197,6 +269,15 @@ class MachineProfile:
             if key in values:
                 values[key] = tuple(float(v) for v in values[key])
         values["keep_out_zones"] = [KeepOutZone.from_dict(z) for z in data.get("keep_out_zones", [])]
+        values["axes"] = [AxisSpec.from_dict(a) for a in data.get("axes", []) or []]
+        values["tool_changer"] = ToolChanger.from_dict(data.get("tool_changer"))
+        values["aux_outputs"] = [AuxOutput.from_dict(a) for a in data.get("aux_outputs", []) or []]
+        values["rotary_devices"] = [RotaryDevice.from_dict(r) for r in data.get("rotary_devices", []) or []]
+        values["bar_feed"] = BarFeed.from_dict(data.get("bar_feed"))
+        values["tool_table"] = ToolTable.from_dict(data.get("tool_table"))
+        values["heads"] = [Head.from_dict(h) for h in data.get("heads", []) or []]
+        if "rotary_centre_mm" in values:
+            values["rotary_centre_mm"] = tuple(float(v) for v in values["rotary_centre_mm"])
         raw_limits = data.get("soft_limits", {}) or {}
         values["soft_limits"] = {a: SoftLimit.from_dict(raw_limits.get(a, {})) for a in AXES}
         return cls(**values)
@@ -310,8 +391,34 @@ class MachinesTab(QWidget):
         self.name = QLineEdit()
         form.addRow("Name", self.name)
         self.controller = QComboBox()
-        self.controller.addItems(["GRBL"])
+        self.controller.addItems(list(CONTROLLERS))
+        self.controller.setToolTip("GRBL, grblHAL and FluidNC are run from BasiCAM; export-only controllers get a G-code file.")
         form.addRow("Controller", self.controller)
+        self.process = QComboBox()
+        for key, label in PROCESSES.items():
+            self.process.addItem(label, key)
+        form.addRow("Process", self.process)
+        self.layout_combo = QComboBox()
+        for key, label in LAYOUT_LABELS.items():
+            self.layout_combo.addItem(label, key)
+        self.layout_combo.currentIndexChanged.connect(self._layout_changed)
+        form.addRow("Axes layout", self.layout_combo)
+        self.axis_table = QTableWidget(0, 5)
+        self.axis_table.setHorizontalHeaderLabels(["Axis", "Type", "Min", "Max", "Continuous"])
+        self.axis_table.setToolTip("Linear axes in mm, rotary axes in degrees; a continuous rotary axis has no end stops.")
+        self.axis_table.setMinimumHeight(120)
+        form.addRow(self.axis_table)
+        self.changer_kind = QComboBox()
+        for key, label in CHANGER_LABELS.items():
+            self.changer_kind.addItem(label, key)
+        form.addRow("Tool changer", self.changer_kind)
+        self.changer_pockets = QSpinBox()
+        self.changer_pockets.setRange(0, 200)
+        self.changer_pockets.setToolTip("How many tools the changer holds (stations on a turret).")
+        form.addRow("Pockets", self.changer_pockets)
+        self.changer_time = self._spin(0, 600, 0)
+        self.changer_time.setToolTip("Seconds per tool change for the cycle time (0 = 8 s with a changer, 60 s by hand).")
+        form.addRow("Tool change time · s", self.changer_time)
         self.travel = [self._spin(0, 5000, 300) for _ in AXES]
         self.max_feed = [self._spin(1, 100000, 3000) for _ in AXES]
         for axis, spin in zip(AXES, self.travel):
@@ -352,6 +459,10 @@ class MachinesTab(QWidget):
         form.addRow(QLabel("Keep-out zones"))
         form.addRow(self.keep_out_table)
         form.addRow(ko_row)
+        rotary = QPushButton("Rotary axis setup...")
+        rotary.setToolTip("Headstock, chuck / collet / rollers, jaws, tailstock, steady rest and speed control.")
+        rotary.clicked.connect(self._edit_rotary)
+        form.addRow(rotary)
         save = QPushButton("Save machine")
         save.setObjectName("primaryButton")
         save.clicked.connect(self._save)
@@ -393,6 +504,15 @@ class MachinesTab(QWidget):
         m = self.machines[index]
         self.name.setText(m.name)
         self.controller.setCurrentText(m.controller)
+        index = self.process.findData(getattr(m, "process", "mill"))
+        self.process.setCurrentIndex(max(0, index))
+        self.layout_combo.blockSignals(True)
+        self.layout_combo.setCurrentIndex(max(0, self.layout_combo.findData(getattr(m, "layout", "gantry3"))))
+        self.layout_combo.blockSignals(False)
+        self._fill_axes(m.axis_specs())
+        self.changer_kind.setCurrentIndex(max(0, self.changer_kind.findData(m.tool_changer.kind)))
+        self.changer_pockets.setValue(int(m.tool_changer.pockets))
+        self.changer_time.setValue(float(m.tool_changer.change_time_s))
         for spin, value in zip(self.travel, m.travel_mm):
             spin.setValue(value)
         for spin, value in zip(self.max_feed, m.max_feed_mm_min):
@@ -423,6 +543,46 @@ class MachinesTab(QWidget):
             zones.append(KeepOutZone(cells[0] or "Keep-out", tuple(nums[:3]), tuple(nums[3:])).normalized())
         return zones
 
+    def _edit_rotary(self) -> None:
+        m = self.current_machine()
+        if m is None:
+            return
+        dialog = RotaryDeviceDialog(m.rotary_device(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if m.rotary_devices:
+            m.rotary_devices[min(max(m.active_rotary, 0), len(m.rotary_devices) - 1)] = dialog.device
+        else:
+            m.rotary_devices.append(dialog.device)
+            m.active_rotary = 0
+        self.store.save(m)
+        self.machinesChanged.emit()
+
+    def _layout_changed(self, _index: int = 0) -> None:
+        layout = self.layout_combo.currentData() or "gantry3"
+        travel = tuple(s.value() for s in self.travel)
+        self._fill_axes(default_axes(layout, travel, self.homing.currentText()))
+
+    def _fill_axes(self, axes: list) -> None:
+        self.axis_table.setRowCount(0)
+        for axis in axes:
+            row = self.axis_table.rowCount()
+            self.axis_table.insertRow(row)
+            for column, value in enumerate((axis.name, axis.kind, f"{axis.minimum:g}", f"{axis.maximum:g}", "yes" if axis.continuous else "no")):
+                self.axis_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _read_axes(self) -> list:
+        axes = []
+        for row in range(self.axis_table.rowCount()):
+            cells = [self.axis_table.item(row, c).text().strip() if self.axis_table.item(row, c) else "" for c in range(5)]
+            try:
+                lo, hi = float(cells[2]), float(cells[3])
+            except ValueError:
+                lo, hi = 0.0, 0.0
+            axes.append(AxisSpec(cells[0] or "X", cells[1] if cells[1] in ("linear", "rotary") else "linear", lo, hi,
+                                 continuous=cells[4].casefold() in ("yes", "true", "1")))
+        return axes
+
     def _save(self) -> None:
         m = self.current_machine()
         if m is None:
@@ -440,6 +600,16 @@ class MachinesTab(QWidget):
         m.tool_change_mode = self.tool_change.currentText()
         m.notes = self.notes.toPlainText()
         m.keep_out_zones = self._read_keep_outs()
+        m.process = self.process.currentData() or "mill"
+        m.layout = self.layout_combo.currentData() or "gantry3"
+        m.axes = self._read_axes()
+        m.tool_changer.kind = self.changer_kind.currentData() or "none"
+        m.tool_changer.pockets = int(self.changer_pockets.value())
+        m.tool_changer.change_time_s = float(self.changer_time.value())
+        problems = m.controller_problems()
+        if problems:
+            QMessageBox.warning(self, "Controller", "\n".join(problems))
+            return
         self.store.save(m)
         self._refresh_list(m.machine_id)
         self.machinesChanged.emit()
@@ -627,7 +797,117 @@ class BedFitDialog(QDialog):
         return self.combo.currentData()
 
 
+class RotaryDeviceDialog(QDialog):
+    """Rotary device setup: kind, headstock, throw, mount, jaws, tailstock, steady rest, speed."""
+
+    def __init__(self, device: RotaryDevice | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Rotary axis setup")
+        self.device = RotaryDevice.from_dict(device.to_dict()) if device is not None else RotaryDevice()
+        d = self.device
+        form = QFormLayout(self)
+        self.name = QLineEdit(d.name)
+        form.addRow("Name", self.name)
+        self.kind = QComboBox()
+        for key, label in DEVICE_KINDS.items():
+            self.kind.addItem(label, key)
+        self.kind.setCurrentIndex(max(0, self.kind.findData(d.kind)))
+        form.addRow("Type", self.kind)
+        self.axis = QComboBox()
+        self.axis.addItems(["A", "B", "C"])
+        self.axis.setCurrentText(d.axis)
+        form.addRow("Axis letter", self.axis)
+        self.orientation = QComboBox()
+        self.orientation.addItems(["X", "Y"])
+        self.orientation.setCurrentText(d.orientation)
+        form.addRow("Spins about", self.orientation)
+        self.centre = [self._spin(-5000, 5000, v) for v in d.centre_mm]
+        centre_row = QHBoxLayout()
+        for spin in self.centre:
+            centre_row.addWidget(spin)
+        form.addRow("Face centre X / Y / Z · mm", centre_row)
+        self.headstock = self._spin(1, 2000, d.headstock_diameter_mm)
+        form.addRow("Headstock / chuck diameter · mm", self.headstock)
+        self.throw = self._spin(1, 2000, d.throw_mm)
+        self.throw.setToolTip("Largest diameter that turns clear of the bed or slide (swing).")
+        form.addRow("Throw (swing) · mm", self.throw)
+        self.mount = QComboBox()
+        self.mount.addItems(list(MOUNTS))
+        self.mount.setCurrentText(d.mount)
+        form.addRow("Workholding", self.mount)
+        self.clamp_min = self._spin(0, 2000, d.clamp_min_mm)
+        self.clamp_max = self._spin(0, 2000, d.clamp_max_mm)
+        form.addRow("Grips from · mm", self.clamp_min)
+        form.addRow("Grips up to · mm", self.clamp_max)
+        self.jaw_width = self._spin(0, 500, d.jaw_width_mm)
+        self.jaw_height = self._spin(0, 500, d.jaw_height_mm)
+        self.jaw_depth = self._spin(0, 500, d.jaw_depth_mm)
+        form.addRow("Jaw width · mm", self.jaw_width)
+        form.addRow("Jaw height (radial) · mm", self.jaw_height)
+        form.addRow("Jaw depth (proud of face) · mm", self.jaw_depth)
+        self.tailstock = QCheckBox("Tailstock")
+        self.tailstock.setChecked(d.tailstock)
+        form.addRow("", self.tailstock)
+        self.steady = QCheckBox("Steady rest")
+        self.steady.setChecked(d.steady_rest)
+        form.addRow("", self.steady)
+        self.speed = QComboBox()
+        self.speed.addItems(["automatic", "manual"])
+        self.speed.setCurrentText(d.speed_control)
+        self.speed.setToolTip("Manual: the program pauses and asks for the spindle / rotation speed to be set by hand.")
+        form.addRow("Speed control", self.speed)
+        self.max_rpm = self._spin(0, 100000, d.max_rpm)
+        form.addRow("Max RPM", self.max_rpm)
+        self.continuous = QCheckBox("Can turn continuously (turning / wrapping)")
+        self.continuous.setChecked(d.continuous)
+        form.addRow("", self.continuous)
+        self.error = QLabel("")
+        self.error.setObjectName("errorText")
+        self.error.setWordWrap(True)
+        form.addRow(self.error)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    @staticmethod
+    def _spin(lo: float, hi: float, value: float) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setRange(lo, hi)
+        spin.setDecimals(3)
+        spin.setValue(float(value))
+        return spin
+
+    def result_device(self) -> RotaryDevice:
+        d = RotaryDevice.from_dict(self.device.to_dict())
+        d.name = self.name.text().strip() or "Rotary"
+        d.kind = self.kind.currentData()
+        d.axis = self.axis.currentText()
+        d.orientation = self.orientation.currentText()
+        d.centre_mm = tuple(s.value() for s in self.centre)
+        d.headstock_diameter_mm = self.headstock.value()
+        d.throw_mm = self.throw.value()
+        d.mount = self.mount.currentText()
+        d.clamp_min_mm, d.clamp_max_mm = self.clamp_min.value(), self.clamp_max.value()
+        d.clamp_diameter_mm = min(max(d.clamp_diameter_mm, d.clamp_min_mm), d.clamp_max_mm)
+        d.jaw_width_mm, d.jaw_height_mm, d.jaw_depth_mm = self.jaw_width.value(), self.jaw_height.value(), self.jaw_depth.value()
+        d.tailstock, d.steady_rest = self.tailstock.isChecked(), self.steady.isChecked()
+        d.speed_control = self.speed.currentText()
+        d.max_rpm = self.max_rpm.value()
+        d.continuous = self.continuous.isChecked()
+        return d
+
+    def _accept(self) -> None:
+        problems = self.result_device().problems()
+        if problems:
+            self.error.setText(" ".join(problems))
+            return
+        self.device = self.result_device()
+        self.accept()
+
+
 __all__ = [
+    "RotaryDeviceDialog",
     "AXES", "SoftLimit", "KeepOutZone", "MachineProfile", "MachineStore", "MachinesTab", "SoftLimitWizard",
     "PreflightDialog", "BedFitDialog", "fit_report", "compatible_machines", "generation_fit_rule",
     "set_soft_margin", "set_released", "tool_stick_out", "z_min_for_tool", "LimitPolicyError",

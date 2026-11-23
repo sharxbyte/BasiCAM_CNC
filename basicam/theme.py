@@ -42,6 +42,7 @@ TOKENS: dict[str, str] = {
     "ok": "#3fb950",
     "warning": "#f2c94c",
     "error": "#ff4d4d",
+    "keepout": "#ff4d4d",  # jaws, chuck faces, clamps: no-go geometry (red by request)
     # sketch states
     "sketch_defined": "#e4e9e5",
     "sketch_underdefined": "#f2c94c",
@@ -60,6 +61,7 @@ COLORBLIND_TOKENS: dict[str, str] = {
     "ok": "#009E73",
     "warning": "#F0E442",
     "error": "#D55E00",
+    "keepout": "#D55E00",
     "sketch_underdefined": "#F0E442",
     "accent": "#F0E442",
     "tool": "#56B4E9",
@@ -68,7 +70,7 @@ COLORBLIND_TOKENS: dict[str, str] = {
 SETUP_PALETTE_DEFAULT: tuple[str, ...] = ("#c2df54", "#68b5e8", "#e89f54", "#c58be8", "#5ad2b0", "#d6b58a")
 SETUP_PALETTE_COLORBLIND: tuple[str, ...] = ("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#CC79A7")
 
-ERROR_TOKENS = frozenset({"error"})
+ERROR_TOKENS = frozenset({"error", "keepout"})  # the only tokens that may be red (errors, keep-out geometry)
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 ACTIVE: dict[str, str] = dict(TOKENS)

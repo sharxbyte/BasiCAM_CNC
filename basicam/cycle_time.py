@@ -31,7 +31,10 @@ SPINDLE_RESET, SPINDLE_PLUS_10, SPINDLE_MINUS_10, SPINDLE_PLUS_1, SPINDLE_MINUS_
 
 
 def _length(seg) -> float:
-    return math.dist(seg.start, seg.end)
+    """Travel of a move; wrapped rotary moves add their distance on the cylinder surface."""
+    straight = math.dist(seg.start, seg.end)
+    surface = float((getattr(seg, "metadata", None) or {}).get("surface_mm", 0.0) or 0.0)
+    return math.hypot(straight, surface) if surface > 0 else straight
 
 
 @dataclass
@@ -46,6 +49,8 @@ class CycleEstimator:
         self.segments = list(segments)
         rapid = getattr(machine, "rapid_mm_min", None) if machine is not None else None
         self.rapid_mm_min = float(rapid or default_rapid_mm_min)
+        changer = getattr(machine, "tool_changer", None) if machine is not None else None
+        self.tool_change_s = float(changer.time_s()) if changer is not None else TOOL_CHANGE_S
         self.allowances = self._detect_allowances()
         self._cut_s = [self._seg_time(s) if s.kind not in RAPID_KINDS else 0.0 for s in self.segments]
         self._rapid_s = [_length(s) / self.rapid_mm_min * 60.0 if s.kind in RAPID_KINDS else 0.0 for s in self.segments]
@@ -65,7 +70,7 @@ class CycleEstimator:
             if index and setup is not None and prev_setup is not None and setup != prev_setup:
                 out.append(Allowance(index, REPOSITION_S, f"reposition to {setup}"))
             elif index and tool and prev_tool and tool != prev_tool:
-                out.append(Allowance(index, TOOL_CHANGE_S, f"tool change to {tool}"))
+                out.append(Allowance(index, getattr(self, "tool_change_s", TOOL_CHANGE_S), f"tool change to {tool}"))
             prev_tool = tool or prev_tool
             prev_setup = setup if setup is not None else prev_setup
         return out

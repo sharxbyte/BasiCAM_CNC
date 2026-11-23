@@ -1,4 +1,4 @@
-# BasiCAM CNC
+﻿# BasiCAM CNC
 
 Desktop CAD/CAM with GRBL machine control, for Windows and Linux.
 
@@ -6,26 +6,29 @@ Source: <https://github.com/sharxbyte/BasiCAM_CNC>
 
 ## Development status
 
-- Version: all 13 roadmap blocks complete (2026-11-21).
-- Last change (block 13): DWG import through the ODA File Converter, **File > Export part...** (STL / STEP), timestamped GRBL alarm and error reporting, refreshed documentation, final UI audit.
+- Version: roadmap v1 complete (13 blocks, 2026-11-21); roadmap v2 block 23 of 23 done (2026-11-22 19:04).
+- Last change (v2 block 23): hardening and docs: FEATURE_OUTLINE.md (modules, safety boundaries, known limits), docs/hardware_test.md (laser / plasma / waterjet / EDM, rotary, lathe and bar-feed checks), docs/sketching.md; 159 tests, UI audit clean, every module in the spec; exe built.
 - Open items: none from the roadmap. Quarantined: none.
 - **Not yet run against a real machine.** Use `docs/hardware_test.md` for the first session and verify all generated G-code independently.
 
 ## What it does
 
-- **Import**: STEP and IGES (exact B-rep), STL (converted to solids when watertight), DXF and DWG linework, SLDPRT on Windows with SolidWorks installed. Unsupported drawing entities are listed after import. **File > Export part...** writes STL or STEP and lists anything that could not be exported.
-- **View**: Shaded, Unshaded solid, Transparent shaded, Hidden lines (hidden edges dashed) and Wireframe; only real face boundaries are drawn. **Lighting...** sets brightness, contrast and light direction. Colour-blind palette and colour overrides in Preferences; red is reserved for errors.
-- **Sketch**: point, line, rectangle (corner / center / 3 point), circle (center / 3 point), arc (3 point / center) and spline, with snaps and construction geometry. Dimensions take mm, cm, m, in, ft and fractions. Each sketch is solved after every edit (python-solvespace): fully defined, under-defined (yellow, `*`) or could not solve (red). Relations: coincident, horizontal, vertical, parallel, perpendicular, tangent, equal, concentric, midpoint, fix, anchor to origin or model.
-- **Position**: translate, rotate, align (face to face, vertex to vertex, face to plane, point to coordinates or a sketch point), work origin and axes from a picked point and edge; arrow keys nudge the selected part when the view is square to a face.
-- **Machines**: a machine inventory (travel, feeds, spindle range, homing, keep-out zones), soft limits recorded at the endstops, a preflight check after every connect or alarm, and bed-fit warnings.
-- **Operations**: tools only on fully defined sketch entities; depth and entry options (first passes, final pass, ramp, lead-in/out); 3-axis surface roughing and finishing (**Trace curved face...**); setup work offset and heights; a generation gate for untooled sketches; drag to reorder, duplicate, assign to several targets.
-- **Motion guard**: every jog, keyboard move, console line, generated program and stream is checked against a tool envelope (radius = diameter/2 + 5 mm). Hard limits and keep-out zones can never be overridden.
-- **Run**: live cycle-time estimate, speed multiplier (GRBL overrides up to 200%, more only with a safety switch), keyboard machine control with a ghost preview (virtual by default), and the **Advanced G-code** editor (preview from a line, delete prior operations, resume with a safe preamble, export a section with its setup sheet).
-- **Projects**: `.bcam` bundles with undo/redo (50 steps by default), autosave and crash recovery; one shared terminal log for the app and the controller.
+- **Import**: STEP and IGES (exact B-rep), STL (converted to solids when watertight; flat areas grouped into faces), DXF and DWG linework, SLDPRT on Windows with SolidWorks installed. The first part goes to 0,0,0 at its bounding-box corner (**Keep file coordinates** keeps the file's position); later parts are placed beside the existing ones. Several parts can be opened at once, with one material and thickness for all or a list per part. Box selection takes whole faces. **File > Export part...** writes STL or STEP.
+- **Stock and materials**: block, sheet, plate, bar and tube stock (**Stock...**); a material library (Tool inventory > Materials). **Tools > Nest parts on the stock...** nests parts true-shape on sheets (part-in-hole, spacing 2 x kerf by default, rotation off unless allowed, grain lock, separate stocks per material).
+- **View**: Shaded, Unshaded solid, Transparent shaded, Hidden lines and Wireframe; **Lighting...**; colour-blind palette. Red is reserved for errors and keep-out geometry (jaws, chuck faces).
+- **Sketch** (see `docs/sketching.md`): SolidWorks-style drawing with rubber-band previews, line chaining, typed lengths and screen-distance snapping; snapping to a model vertex defines the point there. Point, line, rectangle, circle, arc, spline, slot, polygon, centerline. Relations panel with glyphs, drag to explore, **Smart Dimension (D)** with arithmetic, and Trim, Extend, Offset, Mirror, Fillet, Chamfer, Convert Entities, Move/Copy and Fully Define.
+- **Operations**: tools only on fully defined sketches that pass Check Sketch. Pocket (around islands), Profile (inside / outside / on), Trace, Drill (pecks), Engrave, and **Assign tool...** on a surface, which builds a toolpath sketch outside the surface (stepover 60% of the tool, rounded away from the material, rough then 3-axis finish).
+- **Machines**: mill / router, laser, plasma, waterjet, wire EDM, lathe, mill-turn, rotary laser and laser lathe; 3-axis, 4th-axis, 5-axis (3+2), lathe and U/V layouts with an axis table and kinematics; tool changers with a tool table; auxiliaries (air, gas, coolant, cutting fluid, water, vacuum, dust, fumes); usage and maintenance counters per machine and per job.
+- **Cutting**: cut charts per process, material and thickness; kerf compensation; leads placed for the most clearance from other parts and features (never closer than half the kerf plus a margin) and always over the stock; tabs and micro-joints (2 x kerf by default); pierces off the contour; flash cutting for lasers with fast beam gating; inside-first cut order; taper compensation. The beam is never on during a rapid or outside the stock. **Laser test fire** needs its safety switch.
+- **Rotary and lathe**: rotary axis setup (headstock, throw, chuck / collet / rollers, jaws, tailstock, steady rest, speed control); flat / round / on-a-3D-object prompt; wrapped and indexed rotary work (G93 feeds); 3+2 positioning to a face; turning setup with off-centre turning and a side view; facing, roughing, nose-radius-compensated finishing, grooving, parting, drilling and threading (where supported); lathe post (G18, diameter mode, G96 / G95); moving keep-outs for chuck, jaws, tailstock and steady rest; bar feeders with production runs.
+- **Position**: translate, rotate, align, work origin and axes; arrow keys nudge the selected part.
+- **Motion guard**: every jog, keyboard move (including the rotary axis), console line, generated program and stream is checked against the tool and holder envelope, rotary limits and keep-out zones. Hard limits and keep-outs can never be overridden.
+- **Run**: live cycle-time estimate (tool changes, rotary moves), speed multiplier, keyboard machine control, the **Advanced G-code** editor.
+- **Projects**: `.bcam` bundles with undo/redo, autosave and crash recovery; one shared terminal log.
 
 ## Supported machines and controllers
 
-GRBL 1.1-compatible controllers over USB serial (3-axis mills and routers). Other controllers and protocols are not supported. Feed and spindle overrides follow GRBL 1.1 (10-200%; rapids 25/50/100%).
+Streamed over USB serial: GRBL 1.1 (3 axes), grblHAL and FluidNC (up to 6 axes; grblHAL lathe mode). Other controllers (LinuxCNC, industrial laser, waterjet and EDM controllers) get G-code files to run on their own software. A machine whose axes do not match the controller is refused.
 
 ## Requirements
 

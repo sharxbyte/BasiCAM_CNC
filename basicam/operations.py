@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -22,7 +22,18 @@ class Operation:
     ramp_length_mm: float = 10.0
     lead_in_mm: float = 0.0
     lead_out_mm: float = 0.0
+    # contour targets (v2 Block 8): Pocket / Profile / Trace / Drill on sketch contours
+    profile_side: str = "Outside"  # Profile: "Inside", "Outside" or "On"
+    stepover_ratio: float = 0.6  # Pocket: ring spacing as a fraction of the tool diameter
+    peck_mm: float = 0.0  # Drill: peck depth (0 = one plunge)
+    aux: list = field(default_factory=list)  # auxiliaries on during this operation (v2 Block 12)
+    process_params: dict = field(default_factory=dict)  # laser / plasma / waterjet / EDM cut settings (Block 13)
+    wrap: bool = False  # wrap the sketch onto the round stock with the rotary axis (Block 17)
+    lathe: dict = field(default_factory=dict)  # turning: allowance, step, groove z/width, thread pitch... (Block 21)
 
+
+# Fields added in roadmap v2; saved with each operation, old files keep the defaults.
+EXTRA_FIELDS = ("profile_side", "stepover_ratio", "peck_mm", "aux", "process_params", "wrap", "lathe")
 
 ENTRY_FIELDS = (
     "first_pass_count", "first_pass_depth_mm", "final_pass_depth_mm", "ramp_mode",

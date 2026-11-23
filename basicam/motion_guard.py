@@ -62,7 +62,10 @@ class ToolEnvelope:
     def from_tool(cls, tool) -> "ToolEnvelope":
         diameter = float(getattr(tool, "diameter_mm", 6.0) or 6.0) if tool is not None else 6.0
         stick = tool_stick_out(tool) if tool is not None else 40.0
-        return cls(radius=diameter / 2.0 + ENVELOPE_CLEARANCE_MM, height=max(stick, 1.0))
+        # the holder / collet nut is part of the envelope (Block 11)
+        holder = float(getattr(tool, "holder_diameter_mm", 0.0) or 0.0) if tool is not None else 0.0
+        holder_length = float(getattr(tool, "holder_length_mm", 0.0) or 0.0) if tool is not None else 0.0
+        return cls(radius=max(diameter, holder) / 2.0 + ENVELOPE_CLEARANCE_MM, height=max(stick + holder_length, 1.0))
 
 
 @dataclass(frozen=True)
@@ -166,6 +169,82 @@ def check_move(
 
 # ---------------------------------------------------------------------- program interpreter
 _WORD = re.compile(r"([A-Z])\s*([-+]?(?:\d+\.?\d*|\.\d+))")
+
+
+def check_joint_move(
+    machine: MachineProfile | None,
+    tool,
+    start: dict,
+    end: dict,
+    *,
+    obstacles: Iterable[Obstacle] = (),
+    rotating_obstacles: Iterable[Obstacle] = (),
+    cutting: bool = False,
+    release_allowed: bool = False,
+    line: int | None = None,
+) -> list[Violation]:
+    """Multi-axis move (joint values by axis name): sampled along the joint path; each sample is
+    checked for rotary limits (degrees), linear limits, and the tool - oriented along its axis
+    by forward kinematics - against keep-out boxes in machine coordinates and against
+    ``rotating_obstacles`` (fixtures on the rotary table, workpiece coordinates).
+    HARD and KEEPOUT stay absolute; the 3-axis check_move is unchanged."""
+    import numpy as np
+
+    from basicam.kinematics import KinematicSetup, forward
+
+    if machine is None:
+        return []
+    env = ToolEnvelope.from_tool(tool)
+    setup = KinematicSetup.of(machine)
+    specs = {a.name: a for a in machine.axis_specs()}
+    names = sorted(set(start) | set(end))
+    linear_span = max((abs(float(end.get(n, start.get(n, 0.0))) - float(start.get(n, 0.0)))
+                       for n in names if specs.get(n) is None or specs[n].kind == "linear"), default=0.0)
+    rotary_span = max((abs(float(end.get(n, start.get(n, 0.0))) - float(start.get(n, 0.0)))
+                       for n in names if specs.get(n) is not None and specs[n].kind == "rotary"), default=0.0)
+    steps = max(1, int(math.ceil(linear_span / max(env.radius / 2.0, 0.5))), int(math.ceil(rotary_span / 2.0)))
+    fixed = list(obstacles) + [Obstacle(z.name, tuple(z.min_xyz), tuple(z.max_xyz), "keepout") for z in machine.keep_out_zones]
+    turning = list(rotating_obstacles)
+    found: dict[tuple, Violation] = {}
+    reach = max(env.height, env.radius)
+    for k in range(steps + 1):
+        f = k / steps
+        joints = {n: float(start.get(n, 0.0)) + (float(end.get(n, start.get(n, 0.0))) - float(start.get(n, 0.0))) * f for n in names}
+        for name, value in joints.items():
+            spec = specs.get(name)
+            if spec is None or spec.kind != "rotary" or spec.continuous:
+                continue
+            if value < spec.minimum - 1e-9 or value > spec.maximum + 1e-9:
+                found.setdefault((ViolationKind.HARD, name), Violation(
+                    ViolationKind.HARD, f"{name} {value:.2f}° is beyond its limit ({spec.minimum:g}° to {spec.maximum:g}°)", name, line))
+        xyz = (joints.get("X", 0.0), joints.get("Y", 0.0), joints.get("Z", 0.0))
+        if setup.layout in ("gantry3", "gantry3_rotary", "table_table5"):
+            for v in _limit_violations(machine, tool, env, xyz, release_allowed):
+                found.setdefault((v.kind, v.axis), replace(v, line=line))
+        # the tool in machine coordinates: tip and points up its axis
+        if setup.layout == "head_table5":
+            from basicam.kinematics import _ry
+
+            axis_m = _ry(joints.get("B", 0.0)) @ np.array([0.0, 0.0, 1.0])
+        else:
+            axis_m = np.array([0.0, 0.0, 1.0])
+        tip_m = np.asarray(xyz, dtype=float)
+        points_m = [tip_m + axis_m * (reach * i / 3.0) for i in range(4)]
+        for ob in fixed:
+            if any(_envelope_hits_box(p, ToolEnvelope(env.radius, env.below_tip, 0.0), ob.min_xyz, ob.max_xyz) for p in points_m):
+                key = (ViolationKind.KEEPOUT if ob.kind == "keepout" else ViolationKind.COLLISION, ob.name)
+                text = f"enters keep-out zone '{ob.name}'" if ob.kind == "keepout" else f"collides with '{ob.name}'"
+                if ob.kind == "keepout" or ob.kind == "fixture" or not cutting:
+                    found.setdefault(key, Violation(key[0], text, None, line))
+        if turning:
+            tip_w, axis_w = forward(setup, joints)
+            points_w = [tip_w + axis_w * (reach * i / 3.0) for i in range(4)]
+            for ob in turning:
+                if any(_envelope_hits_box(p, ToolEnvelope(env.radius, env.below_tip, 0.0), ob.min_xyz, ob.max_xyz) for p in points_w):
+                    kind = ViolationKind.KEEPOUT if ob.kind == "keepout" else ViolationKind.COLLISION
+                    found.setdefault((kind, ob.name), Violation(kind, f"the rotary move swings the tool into '{ob.name}'", None, line))
+    hard_axes = {v.axis for v in found.values() if v.kind is ViolationKind.HARD}
+    return [v for v in found.values() if not (v.kind is ViolationKind.SOFT and v.axis in hard_axes)]
 
 
 def _strip(line: str) -> str:
@@ -277,12 +356,23 @@ def check_program(
     obstacles: Iterable[Obstacle] = (),
     release_allowed: bool = False,
     stop_after: int = 200,
+    tools_by_number: dict | None = None,
+    tools_by_name: dict | None = None,
 ) -> list[Violation]:
-    """Full pre-check of a program; returns violations with 1-based line numbers."""
+    """Full pre-check of a program; returns violations with 1-based line numbers.
+
+    Tool changes in the program (T<n> M6, or M0 (Change tool: name)) switch the envelope to the
+    new tool and holder for every later move (Block 11)."""
     state = start_state or GuardState()
     obstacles = list(obstacles)
     violations: list[Violation] = []
     for number, raw in enumerate(lines, start=1):
+        change = re.search(r"T(\d+)\s*M0?6", raw.upper())
+        if change and tools_by_number:
+            tool = tools_by_number.get(int(change.group(1)), tool)
+        named = re.search(r"Change tool:\s*([^)]+)\)", raw)
+        if named and tools_by_name:
+            tool = tools_by_name.get(named.group(1).strip(), tool)
         before = state
         points, state = interpret_line(raw, state)
         prev = before.position
@@ -374,7 +464,8 @@ class MotionGuard:
     def work_offset_known(self) -> bool:
         return getattr(self.window, "last_wco", None) is not None
 
-    def check_program_text(self, text: str, start: GuardState | None = None) -> list[Violation]:
+    def check_program_text(self, text: str, start: GuardState | None = None, tools_by_number: dict | None = None,
+                           tools_by_name: dict | None = None) -> list[Violation]:
         """Pre-check a whole program. Without a known work offset the machine limits cannot be
         placed, so only fixtures (in work coordinates) are checked; streams re-check when connected."""
         machine = self.machine() if self.work_offset_known() else None
@@ -384,6 +475,7 @@ class MotionGuard:
         return check_program(
             machine, self.tool(), text.splitlines(), start,
             obstacles=self.obstacles(), release_allowed=self.release_allowed(),
+            tools_by_number=tools_by_number, tools_by_name=tools_by_name,
         )
 
     def report(self, violations: list[Violation], title: str, show_dialog: bool = True) -> bool:

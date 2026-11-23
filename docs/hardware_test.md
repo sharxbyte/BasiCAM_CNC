@@ -52,3 +52,28 @@ Machine: ______________ Controller / firmware: ______________ Date: __________ T
 
 - [ ] Soft stock (wax, foam or MDF), a known tool, conservative feeds; watch the whole program with a hand on the E-stop.
 - [ ] Measure the part and compare it with the sketch dimensions.
+
+## 8. Laser, plasma, waterjet and wire EDM (air run first, beam / arc / jet disabled at the source)
+
+- [ ] **Laser test fire** is refused until Settings > Advanced > Allow laser Test fire is on; with it on, the beam fires at 1% for 0.1 s with safety glasses on and the enclosure closed.
+- [ ] A cut program: the console shows the beam command (M3 / M4 S...) only after the pierce position is reached, and M5 before every rapid. No G0 line ever appears between a beam-on and the following M5.
+- [ ] Plasma: pierce height, pierce delay (G4) and cut height match the cut chart; torch-height control switches as configured.
+- [ ] Waterjet / EDM (export only): the exported file runs in the machine's own software in a dry run.
+- [ ] Tabs / micro-joints hold the parts; lead-ins never touch a neighbouring part; inner contours are cut before the outline.
+- [ ] Flash cutting (only if the laser has fast beam gating): a hole grid runs in rows without stopping at each hole.
+
+## 9. Rotary axis (4th axis or rotary laser)
+
+- [ ] **Rotary axis setup** matches the device (headstock diameter, throw, mount, tailstock); the view shows its chuck and jaws in red.
+- [ ] `[` and `]` turn the rotary axis by the step; a turn beyond a non-continuous limit is refused.
+- [ ] A wrapped square on known-diameter stock measures the sketch size along the surface.
+- [ ] Indexed setups at 0 / 90 / 180 / 270 degrees index before their passes at safe Z.
+
+## 10. Lathe
+
+- [ ] The controller is in lathe mode (grblHAL `$32=2`) and X reads the diameter (G7).
+- [ ] A jog of the tool towards the jaws is refused; facing the free end is allowed.
+- [ ] Threading is offered only when the controller supports G76.
+- [ ] A manual-speed headstock pauses with the RPM prompt.
+- [ ] **Open chuck** is refused while the spindle turns.
+- [ ] Bar feed: a production run of 3 parts parts off, stops the spindle, opens the chuck, advances the bar to the stop, closes the chuck and continues; the job report shows 3 parts and the bar used.

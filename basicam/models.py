@@ -25,6 +25,10 @@ class PartModel:
     role: PartRole = PartRole.TARGET
     note: str = ""
     feature_notes: dict[int, str] = field(default_factory=dict)
+    material: str = ""  # "" = use the job's stock material
+    thickness_mm: float = 0.0  # stock thickness for this part; 0 = from its geometry
+    quantity: int = 1
+    allow_rotation: bool = False  # nesting may rotate this part (off by default)
 
     @property
     def geometry_type(self) -> str:

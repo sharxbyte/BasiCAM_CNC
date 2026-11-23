@@ -15,7 +15,7 @@ import numpy as np
 import pyvista as pv
 
 from basicam.models import PartModel, PartRole
-from basicam.operations import ENTRY_FIELDS, Operation
+from basicam.operations import ENTRY_FIELDS, EXTRA_FIELDS, Operation
 from basicam.setups import MachiningSetup
 from basicam.sketch_workflow import ParametricSketchFeature, SketchDimension, SketchWorkflowManager
 
@@ -115,6 +115,10 @@ def _serialize_sketch_feature(feat: ParametricSketchFeature) -> dict[str, Any]:
         "state": feat.state,
         "broken_reason": feat.broken_reason,
         "status": feat.status,
+        "control_points": (
+            np.asarray(feat.control_points, dtype=float).tolist()
+            if getattr(feat, "control_points", None) is not None else None
+        ),
     }
 
 
@@ -132,6 +136,8 @@ def _deserialize_sketch_feature(data: dict[str, Any]) -> ParametricSketchFeature
             driving=bool(d.get("driving", True)),
             unit_text=str(d.get("unit_text", "mm")),
             sig_figs=int(d.get("sig_figs", 4)),
+            point_refs=[int(i) for i in d.get("point_refs", []) or []],
+            label_offset=[float(v) for v in d.get("label_offset", []) or []],
         )
         for d in data.get("dimensions", [])
     ]
@@ -160,6 +166,10 @@ def _deserialize_sketch_feature(data: dict[str, Any]) -> ParametricSketchFeature
         state=str(data.get("state", "underdefined")),
         broken_reason=str(data.get("broken_reason", "")),
         status=str(data.get("status", "")),
+        control_points=(
+            np.asarray(data["control_points"], dtype=float).reshape(-1, 3)
+            if data.get("control_points") is not None else None
+        ),
     )
 
 
@@ -187,6 +197,12 @@ def _serialize_setups(setups: list[MachiningSetup]) -> list[dict[str, Any]]:
                 "safe_z_mm": float(getattr(setup, "safe_z_mm", 5.0)),
                 "retract_clearance_mm": float(getattr(setup, "retract_clearance_mm", 2.0)),
                 "stock_clearance_mm": float(getattr(setup, "stock_clearance_mm", 1.0)),
+                "work_type": getattr(setup, "work_type", ""),
+                "work_surface": getattr(setup, "work_surface", None),
+                "rotary_index_deg": float(getattr(setup, "rotary_index_deg", 0.0)),
+                "tool_orientation": list(setup.tool_orientation) if getattr(setup, "tool_orientation", None) else None,
+                "rotary_angles": getattr(setup, "rotary_angles", None),
+                "turning": getattr(setup, "turning", None),
             }
         )
     return out
@@ -204,6 +220,11 @@ def _with_extras(operation: Operation, raw: dict[str, Any]) -> Operation:
     for name in ("surface", "single_run"):
         if raw.get(name) is not None:
             setattr(operation, name, raw[name])
+    for name in EXTRA_FIELDS:
+        if raw.get(name) is not None and hasattr(operation, name):
+            default = getattr(operation, name)
+            value = raw[name]
+            setattr(operation, name, type(default)(value) if isinstance(default, (int, float, str, bool)) else value)
     return operation
 
 
@@ -246,6 +267,12 @@ def _deserialize_setups(raw_setups: list[dict[str, Any]]) -> list[MachiningSetup
                 safe_z_mm=float(s.get("safe_z_mm", 5.0)),
                 retract_clearance_mm=float(s.get("retract_clearance_mm", 2.0)),
                 stock_clearance_mm=float(s.get("stock_clearance_mm", 1.0)),
+                work_type=str(s.get("work_type", "") or ""),
+                work_surface=s.get("work_surface"),
+                rotary_index_deg=float(s.get("rotary_index_deg", 0.0) or 0.0),
+                tool_orientation=tuple(float(v) for v in s["tool_orientation"]) if s.get("tool_orientation") else None,
+                rotary_angles=s.get("rotary_angles"),
+                turning=s.get("turning"),
             )
         )
     return out

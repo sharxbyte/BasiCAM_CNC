@@ -41,8 +41,14 @@ def sketch_status(feat, setups) -> SketchStatus:
     return SketchStatus.UNTOOLED
 
 
-def can_assign_tool(feat) -> tuple[bool, str]:
-    """Only fully defined, non-construction, error-free entities can take a tool."""
+def can_assign_tool(feat, sketch_problems: list | None = None) -> tuple[bool, str]:
+    """Only fully defined, non-construction, error-free entities can take a tool.
+
+    ``sketch_problems`` (contours.check_sketch of its sketch): gaps, overlaps, zero-length or
+    self-intersecting entities also block the assignment, with the reason and its location."""
+    for problem in sketch_problems or []:
+        x, y, z = (float(c) for c in problem.location)
+        return False, f"Check Sketch: {problem.message} (at {x:.3f}, {y:.3f}, {z:.3f} mm)."
     if feat.construction:
         return False, f"{feat.name} is construction geometry and needs no tool."
     if feat.has_error:

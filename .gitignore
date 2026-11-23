@@ -8,6 +8,7 @@ build/
 OLD_WORKING
 .codemap/
 helpers/
+CLAUDE.md
 
 # Roadmap test programs (local only)
 tests/gui_helpers.py

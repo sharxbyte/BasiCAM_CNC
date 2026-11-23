@@ -49,6 +49,12 @@ SAFETY_RULES: tuple[SafetyRule, ...] = (
         "The machine can then reach its mechanical end stops.",
     ),
     SafetyRule(
+        "laser_test_fire",
+        "Allow laser Test fire",
+        "Fires the laser for a moment at low power to check alignment. Wear the correct laser safety "
+        "glasses, close the enclosure and keep hands and reflective objects out of the beam.",
+    ),
+    SafetyRule(
         "advanced_gcode_mode",
         "Enable Advanced G-code mode",
         "Enables the Advanced G-code editor, resume-from-line and live edits. Edited code is "

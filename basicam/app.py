@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QKeySequenceEdit,
     QLineEdit,
@@ -52,6 +53,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStyle,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextEdit,
     QToolTip,
@@ -63,12 +66,32 @@ from PySide6.QtWidgets import (
 from vtkmodules.vtkRenderingCore import vtkCellPicker
 from vtkmodules.vtkInteractionStyle import vtkInteractorStyleUser
 
+from basicam.face_selection import box_select_faces, project_points_to_display
 from basicam.importers import (
     SUPPORTED_SUFFIXES,
     load_part,
+    geometry_min_corner,
     load_part_geometry,
+    offset_geometry,
+    place_at_origin,
     scale_solid_shape,
 )
+from basicam.materials import MaterialStore
+from basicam.machine_profiles import RotaryDeviceDialog
+from basicam.tool_changer import ToolChanger, ToolTable, tool_change_block, tools_not_loaded
+from basicam.auxiliaries import AUX_KINDS, AuxOutput, aux_lines, default_aux_for, missing_required
+from basicam.usage_tracking import ITEMS as USAGE_ITEMS, JobUsage, UsageStore, format_usage, usage_from_program
+from basicam.sketch_interaction import (
+    ChainState,
+    cursor_readout,
+    hv_relation,
+    parse_typed_length,
+    preview_geometry,
+    relation_for_snap,
+    tangent_arc_points,
+)
+from basicam.part_materials_dialog import PartMaterialsDialog, SharedMaterialDialog, StockDialog
+from basicam.stock import StockSpec, build_stock_mesh
 from basicam.machine import (
     GrblCapabilities,
     GrblController,
@@ -109,7 +132,9 @@ from basicam.sketch_workflow import (
     sample_circle_points,
     sample_circle_three_points,
     sample_rectangle_points,
+    sample_polygon,
     sample_rectangle_three_points,
+    sample_slot,
     sample_three_point_arc,
 )
 from basicam.cam_features import validate_gcode_program
@@ -174,7 +199,10 @@ from basicam.sketch_solver import (
     closest_reference_points,
     delete_entities,
     dependents_of,
+    mark_part_deleted,
+    model_reference_shift,
     sketch_groups,
+    sketch_status_text,
     solve_all,
 )
 from basicam.sketch_dialogs import CascadeDeleteDialog, CascadeStepDialog, DeleteBadSketchDialog
@@ -300,6 +328,14 @@ def parse_length_to_mm(text: str, default_unit_mm: float = 1.0) -> float | None:
     return sign * total if matched else None
 
 
+def _is_plain_number(text: str) -> bool:
+    try:
+        float(str(text).strip())
+        return True
+    except ValueError:
+        return False
+
+
 def describe_length_text(text: str, display_unit: str = "mm") -> tuple[str, int]:
     """Unit the user typed (display unit if bare) and the significant figures of the number."""
     found = re.search(r"[a-zA-Z\"'′″]+", text)
@@ -308,6 +344,42 @@ def describe_length_text(text: str, display_unit: str = "mm") -> tuple[str, int]
     digits = re.sub(r"[^0-9.]", "", text.split("/")[0] if "/" in text and " " not in text.strip() else text)
     core = digits.replace(".", "").lstrip("0") or "0"
     return unit, max(1, min(len(core), 10))
+
+
+def _model_vertices_and_edges(part) -> tuple[np.ndarray, np.ndarray]:
+    """Snap targets of a part: true vertices (edge end points) and edge segments (M, 2, 3).
+
+    B-rep parts use their edge mesh (one polyline per edge); meshes use the edges between their
+    facet groups (feature edges) and the mesh vertices on them.
+    """
+    edge_mesh = getattr(part, "edge_mesh", None)
+    if edge_mesh is None or edge_mesh.n_points == 0:
+        try:
+            edge_mesh = part.mesh.extract_feature_edges(
+                feature_angle=10.0, boundary_edges=True, feature_edges=True,
+                manifold_edges=False, non_manifold_edges=False,
+            )
+        except Exception:
+            edge_mesh = None
+    if edge_mesh is None or edge_mesh.n_points == 0:
+        points = np.asarray(part.mesh.points, dtype=float)
+        return points, np.zeros((0, 2, 3))
+    points = np.asarray(edge_mesh.points, dtype=float)
+    segments, ends = [], []
+    lines = np.asarray(edge_mesh.lines, dtype=np.int64) if edge_mesh.n_lines else np.zeros(0, dtype=np.int64)
+    i = 0
+    while i < len(lines):
+        count = int(lines[i])
+        ids = lines[i + 1:i + 1 + count]
+        if count >= 2:
+            ends.extend((ids[0], ids[-1]))
+            segments.extend(zip(ids[:-1], ids[1:]))
+        i += count + 1
+    if not segments:
+        return points, np.zeros((0, 2, 3))
+    seg = np.asarray(segments, dtype=np.int64)
+    vertices = points[np.unique(np.asarray(ends, dtype=np.int64))]
+    return vertices, np.stack((points[seg[:, 0]], points[seg[:, 1]]), axis=1)
 
 
 def format_length(value_mm: float, display_unit: str = "mm", sig_figs: int = 4) -> str:
@@ -377,6 +449,10 @@ class WorkspaceBundleMixin:
             "native_brep": bool(getattr(part, "native_brep", False)),
             "solid_conversion_message": getattr(part, "solid_conversion_message", "") or "",
             "solid_is_brep": solid_is_brep,
+            "material": getattr(part, "material", "") or "",
+            "thickness_mm": float(getattr(part, "thickness_mm", 0.0) or 0.0),
+            "quantity": int(getattr(part, "quantity", 1) or 1),
+            "allow_rotation": bool(getattr(part, "allow_rotation", False)),
         }
 
     def _collect_extras(self) -> dict:
@@ -391,6 +467,10 @@ class WorkspaceBundleMixin:
             extras["tool_assignments"] = self.assignment_ledger.to_dict()
         if getattr(self, "gcode_progress", None):
             extras["gcode_progress"] = dict(self.gcode_progress)
+        spec = getattr(self, "stock_spec", None)
+        extras["stock_spec"] = spec.to_dict() if spec is not None else None
+        job = getattr(self, "job_usage", None)
+        extras["job_usage"] = {"items": job.items, "cut_minutes": job.cut_minutes} if job is not None else None
         store = getattr(self.sketch_workflow, "last_good", None)
         extras["sketch_last_good"] = {
             owner: {
@@ -404,7 +484,16 @@ class WorkspaceBundleMixin:
     def _apply_extras(self, extras: dict) -> None:
         """Restore project data stored under `extras`; unknown keys are kept for round trips."""
         self._loaded_extras = dict(extras or {})
-        self.sketch_notes = {str(k): str(v) for k, v in dict(self._loaded_extras.get("sketch_notes", {})).items()}
+        saved_job = self._loaded_extras.get("job_usage")
+        self.job_usage = (
+            JobUsage({k: float(v) for k, v in dict(saved_job.get("items", {})).items()}, float(saved_job.get("cut_minutes", 0.0)))
+            if isinstance(saved_job, dict) else None
+        )
+        saved_spec = self._loaded_extras.get("stock_spec")
+        self.stock_spec = StockSpec.from_dict(saved_spec) if isinstance(saved_spec, dict) else None
+        if hasattr(self, "stock_kind_label"):
+            self._refresh_stock_kind_label()
+        self.sketch_notes ={str(k): str(v) for k, v in dict(self._loaded_extras.get("sketch_notes", {})).items()}
         if hasattr(self, "notes_list"):
             self._refresh_notes_list()
         if hasattr(self, "sketch_workflow"):
@@ -506,6 +595,10 @@ class WorkspaceBundleMixin:
             )
             part.note = str(meta.get("note", ""))
             part.feature_notes = {int(k): v for k, v in dict(meta.get("feature_notes", {})).items()}
+            part.material = str(meta.get("material", "") or "")
+            part.thickness_mm = float(meta.get("thickness_mm", 0.0) or 0.0)
+            part.quantity = max(1, int(meta.get("quantity", 1) or 1))
+            part.allow_rotation = bool(meta.get("allow_rotation", False))
             parts.append(part)
 
         self.parts = parts
@@ -1161,6 +1254,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         set_dwg_converter(str(self.settings.value("import/dwg_converter", "") or ""))
         self.safety = SafetyGates(self.settings)
         self.machine_store = MachineStore(self.settings)
+        self.material_store = MaterialStore(self.settings)
+        self.stock_spec: StockSpec | None = None
         self.current_machine: MachineProfile | None = self.machine_store.get(self.machine_store.default_id)
         self.last_wco: tuple[float, float, float] | None = None
         self.preflight_complete = False
@@ -1207,6 +1302,19 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.assignment_ledger = AssignmentLedger()
         self.sketch_entities: list[SketchEntity] = []
         self.pending_sketch_points: list[np.ndarray] = []
+        self.sketch_chain = ChainState()  # line chaining (sketch-engine.spec B4)
+        self._click_snaps: list = []  # snap of each placed click of the entity in progress
+        self._last_snap = None
+        self._typed_value = ""  # digits typed while drawing (length / radius)
+        self._last_cursor_world: np.ndarray | None = None
+        self._suppress_inference = False  # Ctrl held: no automatic relations
+        self._model_snap_cache: dict = {}
+        self._dim_picks: list = []  # Smart Dimension: picked entities / points
+        self._dim_plan = None
+        self._pending_dimension: dict | None = None  # placed, waiting for its value
+        self._dimension_editor = None
+        self._editing_dimension: tuple[str, str] | None = None
+        self.dragging_dimension: tuple[str, str] | None = None
         self.active_sketch_id: str | None = None
         self.dragging_sketch: tuple[str, int] | None = None
         self.measure_points: list[np.ndarray] = []
@@ -1385,6 +1493,22 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                         opacity=0.65,
                         name=f"sketch-plane-ref-{idx}",
                     )
+        self._draw_dimensions()
+        if self._show_relation_glyphs():
+            positions, labels = self._relation_glyphs()
+            if len(labels):
+                self.plotter.add_point_labels(
+                    positions, labels, name="sketch-relation-glyphs", font_size=11,
+                    text_color=theme_color("muted"), shape_opacity=0.0, show_points=False,
+                    always_visible=True, pickable=False,
+                )
+
+    def _show_relation_glyphs(self) -> bool:
+        return bool(self.settings.value("view/sketch_relations", True, type=bool))
+
+    def _set_relation_glyphs(self, on: bool) -> None:
+        self.settings.setValue("view/sketch_relations", bool(on))
+        self._refresh_scene(reset_camera=False)
 
     @staticmethod
     def _sketch_polyline(points) -> pv.PolyData:
@@ -1555,7 +1679,9 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.operation_form.setRowVisible(widget, visible)
 
     def open_tool_library(self) -> None:
-        dialog = ToolLibraryDialog(self.tools, self, machine_store=self.machine_store)
+        dialog = ToolLibraryDialog(
+            self.tools, self, machine_store=self.machine_store, material_store=self.material_store
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.tools = dialog.tools
             self.settings.setValue(
@@ -1631,6 +1757,10 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
     def _sync_machine_profile(self) -> None:
         profile = self.current_machine.kinematics_profile() if self.current_machine else MachineKinematicsProfile()
         self.envelope_checker = MachineEnvelopeChecker(profile)
+        if hasattr(self, "usage_table"):
+            self._refresh_aux_usage_panel()
+        if hasattr(self, "tool_table_widget"):
+            self._refresh_tool_table_panel()
 
     def _set_current_machine(self, machine_id: str | None, load_state: bool = True) -> None:
         """Select a machine for this project and as the default for new projects."""
@@ -1647,6 +1777,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self._refresh_machine_combo()
         self._mark_dirty()
         self.terminal_core.log("info", f"Machine: {machine.name if machine else 'none selected'}")
+        if machine is not None and hasattr(self, "setups"):
+            QTimer.singleShot(0, self._maybe_ask_job_type)  # 2D machines ask flat / round / 3D object once
 
     def _open_soft_limit_wizard(self) -> None:
         if self.current_machine is None:
@@ -1800,7 +1932,12 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
 
         sketch_menu = self.menuBar().addMenu("Sketch")
         self._add_command(sketch_menu, "sketch_new", "New sketch / finish sketch", "S", self.sketch_mode.toggle)
-        self._add_command(sketch_menu, "sketch_dimension", "Dimension…", "D", self._focus_dimension_input)
+        self._add_command(sketch_menu, "sketch_dimension", "Smart Dimension", "D", lambda *_: self.smart_dimension_btn.toggle())
+        self._add_command(sketch_menu, "sketch_dimension_text", "Dimension value box", "", self._focus_dimension_input)
+        self._add_command(sketch_menu, "sketch_trim", "Trim", "T", lambda *_: self.modify_buttons["trim"].toggle())
+        self._add_command(sketch_menu, "sketch_offset", "Offset entities...", "O", lambda *_: self._run_modify("offset"))
+        self._add_command(sketch_menu, "sketch_mirror", "Mirror", "M", lambda *_: self._run_modify("mirror"))
+        self._add_command(sketch_menu, "sketch_fully_define", "Fully define sketch", "", lambda *_: self._run_modify("fully_define"))
         sketch_menu.addSeparator()
         self._add_command(sketch_menu, "sketch_line", "Line", "L", lambda *_: self._sketch_hotkey("Line", "Two point"))
         self._add_command(sketch_menu, "sketch_circle", "Circle (center point)", "C", lambda *_: self._sketch_hotkey("Circle", "Center"))
@@ -1827,9 +1964,25 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         grid_action.toggled.connect(self.grid_toggle.setChecked)
         self.grid_toggle.toggled.connect(grid_action.setChecked)
         view_menu.addAction(grid_action)
+        self.relation_glyphs_action = QAction("Sketch relations", self)
+        self.relation_glyphs_action.setCheckable(True)
+        self.relation_glyphs_action.setChecked(self._show_relation_glyphs())
+        self.relation_glyphs_action.toggled.connect(self._set_relation_glyphs)
+        view_menu.addAction(self.relation_glyphs_action)
 
         tools_menu = self.menuBar().addMenu("Tools")
         self._add_command(tools_menu, "tool_inventory", "Tool inventory...", "Ctrl+T", self.open_tool_library)
+        self._add_command(tools_menu, "assign_tool_surface", "Assign tool to surface...", "", lambda *_: self.assign_tool_to_surface())
+        self._add_command(tools_menu, "laser_test_fire", "Laser test fire", "", lambda *_: self.test_fire())
+        turning_menu = self.menuBar().addMenu("Turning")
+        self._add_command(turning_menu, "turning_setup", "Turning setup...", "", lambda *_: self.turning_setup_dialog())
+        self._add_command(turning_menu, "turning_side_view", "Side view", "", lambda *_: self.show_turning_side_view(True))
+        self._add_command(turning_menu, "turning_silhouette", "Convert part silhouette", "", lambda *_: self.convert_part_silhouette())
+        self._add_command(turning_menu, "chuck_open", "Open chuck", "", lambda *_: self.open_chuck())
+        self._add_command(turning_menu, "production_run", "Production run...", "", lambda *_: self.production_run_dialog())
+        self._add_command(tools_menu, "orient_3p2", "Orient setup to the selected face (3+2)", "", lambda *_: self.orient_setup_to_face())
+        self._add_command(tools_menu, "rotary_index", "Rotary index angle for this setup...", "", lambda *_: self.set_rotary_index())
+        self._add_command(tools_menu, "nest_parts", "Nest parts on the stock...", "", lambda *_: self.nest_parts_with_dialog())
         self.advanced_gcode_action = self._add_command(
             tools_menu, "advanced_gcode", "Advanced G-code...", "", lambda *_: self.open_advanced_gcode()
         )
@@ -2069,6 +2222,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             "info", "Disconnected. Connect a GRBL-compatible controller to query status or send commands."
         )
         tabs.addTab(self.console_view, "Console")
+        tabs.addTab(self._build_tool_table_panel(), "Tool table")
+        tabs.addTab(self._build_aux_usage_panel(), "Auxiliaries & usage")
 
         self.machine_timer = QTimer(self)
         self.machine_timer.setInterval(100)
@@ -2081,6 +2236,1051 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self._refresh_machine_ports()
         self._refresh_machine_combo()
         self._set_machine_controls()
+
+    # ------------------------------------------------------------ bar feed / production (v2 Block 22)
+    def _spindle_running(self) -> bool:
+        status = getattr(self, "grbl_status", None)
+        rpm = getattr(status, "spindle_rpm", None) if status is not None else None
+        return bool((rpm or 0) > 0 or getattr(self, "_spindle_commanded_on", False))
+
+    def open_chuck(self) -> bool:
+        """Open the chuck by hand: refused while the spindle turns."""
+        machine = getattr(self, "current_machine", None)
+        if machine is None or self.grbl_controller is None:
+            self.statusBar().showMessage("Connect the lathe first.", 3000)
+            return False
+        if self._spindle_running():
+            self.terminal_core.log("error", "Chuck open refused: the spindle is turning. Stop it first (M5).")
+            self.statusBar().showMessage("Stop the spindle before opening the chuck.", 5000)
+            return False
+        self.grbl_controller.send_line(machine.bar_feed.chuck_open)
+        self.terminal_core.log("command", machine.bar_feed.chuck_open)
+        return True
+
+    def production_run_dialog(self) -> bool:
+        count, ok = QInputDialog.getInt(self, "Production run", "Parts to make (0 = until the bar ends):", 0, 0, 100000)
+        if not ok:
+            return False
+        try:
+            program = self._build_full_gcode_program(self._gcode_settings())
+        except ValueError as error:
+            QMessageBox.warning(self, "Production run", str(error))
+            return False
+        return self.start_production_run(program.splitlines(), count)
+
+    def start_production_run(self, program_lines: list[str], count: int = 0) -> bool:
+        """Repeat a lathe program with a bar advance between parts until ``count`` parts (0 = until
+        the bar ends); counted in the job report."""
+        from basicam.bar_feed import ProductionRun, advance_lines
+
+        machine = getattr(self, "current_machine", None)
+        if machine is None or machine.bar_feed.kind == "none":
+            QMessageBox.information(self, "Production run", "Set the machine's bar feed (puller or feeder) first.")
+            return False
+        if machine.bar_feed.parts_per_bar() == 0:
+            QMessageBox.warning(self, "Production run", "No part fits in the bar after the remnant.")
+            return False
+        self.production = ProductionRun(machine.bar_feed, int(count))
+        body = [l for l in program_lines if l.strip() not in ("M30", "M2")]
+        self._production_cycle = body + advance_lines(machine.bar_feed)
+        self.terminal_core.log("info", f"Production run: {self.production.target or 'until bar end'} parts, "
+                                       f"{machine.bar_feed.parts_per_bar()} per bar.")
+        return bool(self.start_program_stream(self._production_cycle, "Production run"))
+
+    def _production_next(self) -> None:
+        """After each completed cycle: count the part, then loop or finish with the job report."""
+        run = getattr(self, "production", None)
+        if run is None:
+            return
+        again = run.part_done()
+        job = getattr(self, "job_usage", None) or JobUsage()
+        job.items["parts_made"] = float(run.made)
+        job.items["bar_used_mm"] = float(run.bar_used_mm())
+        self.job_usage = job
+        if again:
+            QTimer.singleShot(0, lambda: self.start_program_stream(self._production_cycle, f"Production run · part {run.made + 1}", confirm=False))
+            return
+        self.terminal_core.log("info", f"Production run finished: {run.made} parts, bar used {run.bar_used_mm():.1f} mm, "
+                                       f"remnant {run.remnant_mm():.1f} mm. " + " ".join(run.log))
+        self.production = None
+
+    # ------------------------------------------------------------ turning operations (v2 Block 21)
+    LATHE_KINDS = ("Face", "Rough turn", "Finish turn", "Groove", "Part off", "Centre drill", "Thread")
+
+    def _lathe_threading(self) -> bool:
+        from basicam.machine_types import controller_spec
+
+        machine = getattr(self, "current_machine", None)
+        return machine is not None and controller_spec(machine.controller).threading
+
+    def _turning_profile(self, op) -> list:
+        """Half profile [(z, r)] of the target sketch (lines on the XZ plane: X = z, Z = r)."""
+        feat = next((f for f in self.sketch_workflow.features if op.target in (f.name, f.feature_id)), None)
+        if feat is None:
+            return []
+        group = [f for f in self.sketch_workflow.features if (f.owner_sketch_id or "_") == (feat.owner_sketch_id or "_")
+                 and f.kind in ("Line", "Curve") and not f.construction]
+        points = []
+        for f in group:
+            for p in np.asarray(f.points, dtype=float):
+                points.append((round(float(p[0]), 6), round(abs(float(p[2])), 6)))
+        if not points:
+            return []
+        ordered = sorted(set(points), key=lambda c: (c[0], -c[1] if c[0] == min(points)[0] else c[1]))
+        outline = [ordered[0]] + sorted(ordered[1:], key=lambda c: c[0])
+        return outline
+
+    def _turning_segments(self, op) -> list:
+        from basicam import turning as tp
+        from basicam.lathe_tools import nose_radius
+
+        kind = str(op.kind)
+        params = dict(getattr(op, "lathe", {}) or {})
+        spec = getattr(self, "stock_spec", None)
+        stock_r = float(spec.diameter) / 2.0 if spec is not None and spec.kind in ("bar", "tube") else 15.0
+        z_end = float(spec.origin_x + spec.length) if spec is not None and spec.kind in ("bar", "tube") else 60.0
+        tool = next((t for t in getattr(self, "tools", []) if t.name == op.tool), None)
+        meta = {"op": op.name, "tool": op.tool}
+        feed, rpm = float(op.feed_mm_min), int(op.rpm)
+        profile = self._turning_profile(op)
+        if kind == "Thread" and not self._lathe_threading():
+            raise ValueError("Threading needs a controller with G76 (for example grblHAL in lathe mode).")
+        if kind == "Face":
+            z_face = max((z for z, _r in profile), default=z_end - float(op.depth_mm))
+            return tp.facing(stock_r, z_end, z_face, float(op.stepdown_mm), feed, rpm, meta)
+        if kind == "Centre drill":
+            z_face = max((z for z, _r in profile), default=z_end)
+            return tp.drill_on_axis(z_face, float(op.depth_mm), float(op.peck_mm), feed, rpm, meta)
+        if kind == "Groove":
+            return tp.groove(float(params.get("z", z_end - 10.0)), stock_r, float(params.get("bottom_r", stock_r - op.depth_mm)),
+                             float(params.get("width", 3.0)), float(getattr(tool, "groove_width_mm", 3.0) or 3.0), feed, rpm, meta)
+        if kind == "Part off":
+            return tp.part_off(float(params.get("z", min((z for z, _r in profile), default=0.0))), stock_r, 0.0, feed, rpm, meta)
+        if not profile:
+            return []
+        if kind == "Rough turn":
+            return tp.rough_turn(profile, stock_r, z_end, float(op.stepdown_mm), float(params.get("allowance", 0.3)), feed, rpm, meta)
+        if kind == "Finish turn":
+            return tp.finish_turn(profile, nose_radius(tool) if tool is not None else 0.4, feed, rpm, meta)
+        return []
+
+    def _lathe_program(self, segments, ops) -> str:
+        from basicam import turning as tp
+
+        machine = self.current_machine
+        device = machine.rotary_device()
+        spec = getattr(self, "stock_spec", None)
+        z_zero = float(spec.origin_x + spec.length) if spec is not None and spec.kind in ("bar", "tube") else 0.0
+        threads = []
+        for op in ops:
+            if str(op.kind) == "Thread":
+                params = dict(getattr(op, "lathe", {}) or {})
+                threads.append({"pitch": float(params.get("pitch", 1.5)), "z_end": float(params.get("z_end", z_zero - 20.0)),
+                                "depth": float(params.get("depth", 0.92)), "first_cut": float(params.get("first_cut", 0.1))})
+        css = max((float((getattr(op, "lathe", {}) or {}).get("css_m_min", 0.0)) for op in ops), default=0.0)
+        return tp.compile_lathe(
+            segments, diameter_mode=bool(machine.diameter_mode), z_zero=z_zero, css_m_min=css,
+            max_rpm=float(device.max_rpm if device is not None else machine.spindle_max_rpm),
+            controller_threading=self._lathe_threading(), manual_speed=device is not None and device.speed_control == "manual",
+            threads=threads, controller=machine.controller,
+        )
+
+    # ------------------------------------------------------------ turning setup (v2 Block 20)
+    def turning_setup_dialog(self) -> bool:
+        from basicam.turning_setup import TurningSetup
+
+        current = TurningSetup.from_dict(getattr(self.active_setup, "turning", None))
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Turning setup")
+        form = QFormLayout(dialog)
+
+        def spin(value, lo=-10000.0, hi=10000.0, suffix=" mm"):
+            box = QDoubleSpinBox()
+            box.setRange(lo, hi)
+            box.setDecimals(3)
+            box.setSuffix(suffix)
+            box.setValue(float(value))
+            return box
+
+        diameter, length, stick = spin(current.stock_diameter_mm, 0.1), spin(current.stock_length_mm, 0.1), spin(current.stick_out_mm, 0.1)
+        ev, ew = spin(current.eccentric_mm[0]), spin(current.eccentric_mm[1])
+        ev.setToolTip("Off-centre turning: how far the turning axis sits from the stock's own centre.")
+        jaws = QSpinBox()
+        jaws.setRange(0, 12)
+        jaws.setValue(current.jaw_count)
+        grip = spin(current.grip_diameter_mm, 0.1)
+        jaw_w, jaw_h = spin(current.jaw_width_mm, 0.1), spin(current.jaw_height_mm, 0.1)
+        inside = QCheckBox("Grip from the inside (a bore)")
+        inside.setChecked(current.inside_clamp)
+        for label, widget in (("Stock diameter", diameter), ("Stock length", length), ("Stick-out from the jaws", stick),
+                              ("Off-centre Y", ev), ("Off-centre Z", ew), ("Jaws", jaws), ("Gripping diameter", grip),
+                              ("Jaw width", jaw_w), ("Jaw height", jaw_h)):
+            form.addRow(label, widget)
+        form.addRow("", inside)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        current.stock_diameter_mm, current.stock_length_mm, current.stick_out_mm = diameter.value(), length.value(), stick.value()
+        current.eccentric_mm = (ev.value(), ew.value())
+        current.jaw_count, current.grip_diameter_mm = jaws.value(), grip.value()
+        current.jaw_width_mm, current.jaw_height_mm, current.inside_clamp = jaw_w.value(), jaw_h.value(), inside.isChecked()
+        return self.apply_turning_setup(current) is not None
+
+    def apply_turning_setup(self, turning, part_index: int | None = None):
+        """Put the picked axis on the spindle line, set the bar stock (off-centre if asked) and the
+        jaw arrangement; refused when the stock and offset do not turn inside the throw."""
+        from basicam.turning_setup import axis_from_cylinder, longest_axis, placement_matrix, throw_problems
+
+        device = self.ensure_rotary_device()
+        if device is None:
+            return None
+        problems = throw_problems(turning.stock_diameter_mm, turning.eccentric_mm, device.throw_mm,
+                                  device.clamp_min_mm, device.clamp_max_mm)
+        if problems:
+            message = " ".join(problems)
+            self.terminal_core.log("error", f"Turning setup refused: {message}")
+            QMessageBox.warning(self, "Turning setup", message)
+            return None
+        targets = [i for i, p in enumerate(self.parts) if p.role is not PartRole.STOCK and p.mesh is not None and p.mesh.n_points]
+        if part_index is None and not targets:
+            QMessageBox.information(self, "Turning setup", "Import the part to turn first.")
+            return None
+        index = part_index if part_index is not None else (sorted(self.selected_features)[0][0] if self.selected_features else targets[0])
+        part = self.parts[index]
+        if self.selected_features and any(p == index for p, _f in self.selected_features):
+            mesh = part.mesh.compute_normals(cell_normals=True, point_normals=False)
+            ids = np.asarray(mesh.cell_data.get("feature_id", np.arange(mesh.n_cells)))
+            cells = np.isin(ids, [f for p, f in self.selected_features if p == index])
+            point, direction = axis_from_cylinder(mesh.cell_centers().points[cells], np.asarray(mesh.cell_data["Normals"])[cells])
+        else:
+            point, direction = longest_axis(part.mesh.bounds)
+        along = (np.asarray(part.mesh.points) - point) @ (direction / np.linalg.norm(direction))
+        part_length = float(along.max() - along.min())
+        matrix = placement_matrix(point, direction, float(along.min()))
+        matrix[0, 3] += turning.stick_out_mm - part_length  # the far end sits at the stick-out
+        self._push_history("Turning setup")
+        moved = transform_part(part, matrix)
+        part.mesh, part.edge_mesh = moved.mesh, moved.edge_mesh
+        part.brep_shape, part.solid_shape = moved.brep_shape, moved.solid_shape
+        turning.axis_point, turning.axis_direction = tuple(map(float, point)), tuple(map(float, direction))
+        device.clamp_diameter_mm = turning.grip_diameter_mm
+        device.jaw_width_mm, device.jaw_height_mm, device.inside_clamp = turning.jaw_width_mm, turning.jaw_height_mm, turning.inside_clamp
+        if turning.jaw_count in (3, 4, 6) and device.mount.endswith("chuck"):
+            device.mount = {3: "3-jaw chuck", 4: "4-jaw independent chuck", 6: "6-jaw chuck"}[turning.jaw_count]
+        ev, ew = turning.eccentric_mm
+        radius = turning.stock_diameter_mm / 2.0
+        self.apply_stock_spec(StockSpec(kind="bar", length=turning.stock_length_mm, diameter=turning.stock_diameter_mm,
+                                        origin_x=turning.stick_out_mm - turning.stock_length_mm,
+                                        origin_y=ev - radius, origin_z=ew - radius, material=self.stock_material.currentText()))
+        self.active_setup.turning = turning.to_dict()
+        if math.hypot(ev, ew) > 1e-9:
+            from basicam.turning_setup import jaw_offsets
+
+            offsets = jaw_offsets(turning.eccentric_mm, device.jaw_angles())
+            self.terminal_core.log("info", "Off-centre turning - jaw adjustments: " + ", ".join(f"jaw {i + 1} {o:+.3f} mm" for i, o in enumerate(offsets)))
+        self._turning_side_view = True
+        self._refresh_scene(reset_camera=False)
+        return turning
+
+    def show_turning_side_view(self, on: bool = True) -> None:
+        self._turning_side_view = bool(on)
+        if on:
+            self.plotter.view_xz()
+            self.plotter.camera.SetParallelProjection(True)
+        self._refresh_scene(reset_camera=False)
+
+    def _draw_turning_side_view(self) -> None:
+        """Side view: jaw profile and chuck face in red, the centre axis dashed."""
+        if not getattr(self, "_turning_side_view", False):
+            return
+        machine = getattr(self, "current_machine", None)
+        device = machine.rotary_device() if machine is not None else None
+        if device is None:
+            return
+        from basicam.machine_bodies import lathe_bodies
+
+        segments = []
+        for body in lathe_bodies(device):
+            coords = list(body.polygon.exterior.coords)
+            for sign in (1.0, -1.0):  # both sides of the axis
+                for (z0, r0), (z1, r1) in zip(coords[:-1], coords[1:]):
+                    segments.append(((z0, 0.0, sign * r0), (z1, 0.0, sign * r1)))
+        if segments:
+            lines = pv.PolyData()
+            lines.points = np.array([p for seg in segments for p in seg], dtype=float)
+            lines.lines = np.hstack([[2, 2 * i, 2 * i + 1] for i in range(len(segments))])
+            self.plotter.add_mesh(lines, color=theme_color("keepout"), line_width=2.5, name="turning-keepout", pickable=False)
+        spec = getattr(self, "stock_spec", None)
+        reach = float(spec.length) if spec is not None else 100.0
+        axis = self._dashed(pv.lines_from_points(np.array([[-device.body_length_mm, 0.0, 0.0], [reach + 20.0, 0.0, 0.0]])))
+        self.plotter.add_mesh(axis, color=theme_color("reference"), line_width=1.5, name="turning-axis", pickable=False)
+
+    def convert_part_silhouette(self, part_index: int | None = None) -> list:
+        """The part's revolved silhouette as a fully defined half-profile sketch on the XZ plane."""
+        from basicam.sketch_tools import EditResult, NewEntity, fully_define
+        from basicam.turning_setup import half_profile
+
+        targets = [i for i, p in enumerate(self.parts) if p.role is not PartRole.STOCK and p.mesh is not None and p.mesh.n_points]
+        if not targets:
+            return []
+        index = part_index if part_index is not None else targets[0]
+        profile = half_profile(self.parts[index].mesh)
+        manager = self.sketch_workflow
+        if not self.sketch_mode.isChecked():
+            self.work_plane.setCurrentText("XZ plane")
+            self.sketch_mode.setChecked(True)
+        self.set_work_plane("XZ plane")
+        result = EditResult()
+        for i, ((x0, r0), (x1, r1)) in enumerate(zip(profile[:-1], profile[1:])):
+            result.add.append(NewEntity("Line", np.array([[x0, 0.0, r0], [x1, 0.0, r1]])))
+            if i:
+                result.relations.append(Relation("coincident", [(f"new:{i - 1}", 1), (f"new:{i}", 0)]))
+        created = self._apply_edit(result, "Convert part silhouette")
+        relations, dims = fully_define(created, [r for r in manager.relations if set(r.entity_ids()) & {f.feature_id for f in created}])
+        for owner, dim in dims:
+            feat = manager.get_feature(owner)
+            if feat is not None:
+                feat.dimensions.append(dim)
+        manager.relations.extend(relations)
+        self._refresh_sketch_tree()
+        self._refresh_scene(reset_camera=False)
+        return created
+
+    # ------------------------------------------------------------ lathe bodies (v2 Block 19)
+    def _is_lathe(self) -> bool:
+        machine = getattr(self, "current_machine", None)
+        return machine is not None and (machine.process in ("lathe", "mill_turn", "laser_lathe") or machine.layout.startswith("lathe"))
+
+    def lathe_violations(self, segments) -> list:
+        """Tool / holder / turret against chuck, jaws, collet, tailstock and steady rest, and the
+        holder against the stock, for lathe segments (x = radius, z from the chuck face)."""
+        from basicam.machine_bodies import LatheTool, check_lathe_moves, segments_to_moves, stock_profile
+
+        machine = getattr(self, "current_machine", None)
+        device = machine.rotary_device() if machine is not None else None
+        if device is None:
+            return []
+        lathe_segments = [s for s in segments if (s.metadata or {}).get("lathe")]
+        if not lathe_segments:
+            return []
+        tools = {t.name: LatheTool.from_tool(t) for t in getattr(self, "tools", [])}
+        spec = getattr(self, "stock_spec", None)
+        stock = None
+        if spec is not None and spec.kind in ("bar", "tube"):
+            stick = float(getattr(spec, "length", 50.0))
+            stock = stock_profile(spec.diameter, stick, spec.diameter - 2 * spec.wall if spec.kind == "tube" else 0.0)
+        return check_lathe_moves(device, segments_to_moves(lathe_segments), tools, stock)
+
+    # ------------------------------------------------------------ 3+2 positional (v2 Block 18)
+    def orient_setup_to_face(self, normal=None) -> dict | None:
+        """Orient the active setup so the tool is normal to the picked face (or a given vector):
+        the rotary angles come from the machine's inverse kinematics; unreachable faces are refused."""
+        from basicam.kinematics import KinematicSetup, inverse
+
+        machine = getattr(self, "current_machine", None)
+        if machine is None or machine.layout not in ("table_table5", "head_table5", "gantry3_rotary"):
+            QMessageBox.information(self, "3+2", "Choose a 5-axis (or 4th-axis) machine first.")
+            return None
+        if normal is None:
+            if not self.selected_features:
+                QMessageBox.information(self, "3+2", "Select the face the tool should be normal to.")
+                return None
+            part_index = sorted(self.selected_features)[0][0]
+            ids = [f for p, f in self.selected_features if p == part_index]
+            mesh = self.parts[part_index].mesh.compute_normals(cell_normals=True, point_normals=False)
+            fids = np.asarray(mesh.cell_data.get("feature_id", np.arange(mesh.n_cells)))
+            cells = np.isin(fids, ids)
+            normal = np.asarray(mesh.cell_data["Normals"])[cells].mean(axis=0)
+        normal = np.asarray(normal, dtype=float)
+        normal = normal / max(float(np.linalg.norm(normal)), 1e-12)
+        joints = inverse(KinematicSetup.of(machine), np.zeros(3), normal)
+        angles = {k: v for k, v in joints.items() if k in ("A", "B", "C")}
+        problems = self._rotary_limit_problems(machine, angles)
+        if problems:
+            message = "This face cannot be reached: " + "; ".join(problems)
+            self.terminal_core.log("error", message)
+            QMessageBox.warning(self, "3+2", message)
+            return None
+        self._push_history("Orient setup (3+2)")
+        self.active_setup.tool_orientation = tuple(float(v) for v in normal)
+        self.active_setup.rotary_angles = angles
+        self.terminal_core.log("info", f"{self.active_setup.name}: tool normal to the face, " + ", ".join(f"{k} {v:.3f}°" for k, v in angles.items()))
+        return angles
+
+    @staticmethod
+    def _rotary_limit_problems(machine, angles: dict) -> list[str]:
+        specs = {a.name: a for a in machine.axis_specs()}
+        out = []
+        for name, value in angles.items():
+            spec = specs.get(name)
+            if spec is None:
+                out.append(f"the machine has no {name} axis")
+            elif spec.kind == "rotary" and not spec.continuous and not (spec.minimum - 1e-9 <= value <= spec.maximum + 1e-9):
+                out.append(f"{name} {value:.2f}° is outside {spec.minimum:g}° to {spec.maximum:g}°")
+        return out
+
+    def _positional_segments(self, setup, segments) -> list:
+        """3+2: passes made in the tilted frame -> machine coordinates computed here (no G68.2),
+        after a guarded rotary positioning move."""
+        from basicam.cam_dynamics_post import ToolpathSegment
+        from basicam.kinematics import KinematicSetup, orient_points
+        from basicam.motion_guard import blocking, check_joint_move
+
+        normal = getattr(setup, "tool_orientation", None)
+        machine = getattr(self, "current_machine", None)
+        if not normal or machine is None or not segments:
+            return segments
+        kin = KinematicSetup.of(machine)
+        points = [s.start for s in segments] + [segments[-1].end]
+        joints, angles = orient_points(kin, points, normal, getattr(setup, "origin_mm", (0.0, 0.0, 0.0)))
+        problems = self._rotary_limit_problems(machine, angles)
+        if problems:
+            raise ValueError("3+2 setup unreachable: " + "; ".join(problems))
+        known = self.motion_guard.work_offset_known()
+        wco = self.motion_guard.work_offset() if known else (0.0, 0.0, 0.0)
+        first = joints[0]
+        start = {k: (first.get(k, 0.0) + wco["XYZ".index(k)] if k in "XYZ" else 0.0) for k in first}
+        target = {k: (first[k] + wco["XYZ".index(k)] if k in "XYZ" else first[k]) for k in first}
+        violations = check_joint_move(machine, self.motion_guard.tool(), start, target)
+        if not known:
+            violations = [v for v in violations if v.axis in angles]
+        if blocking(violations):
+            raise ValueError("3+2 positioning refused:\n" + "\n".join(v.text() for v in violations[:5]))
+        out = [ToolpathSegment("rapid", (first["X"], first["Y"], first["Z"]), (first["X"], first["Y"], first["Z"]), 0.0, 0,
+                               {**(segments[0].metadata or {}), "rotary": dict(angles), "position_3p2": True})]
+        for seg, a, b in zip(segments, joints[:-1], joints[1:]):
+            out.append(ToolpathSegment(seg.kind, (a["X"], a["Y"], a["Z"]), (b["X"], b["Y"], b["Z"]), seg.feed_mm_min, seg.rpm,
+                                       dict(seg.metadata or {}, rotary=dict(angles))))
+        return out
+
+    # ------------------------------------------------------------ rotary work (v2 Block 17)
+    def set_rotary_index(self, angle: float | None = None) -> bool:
+        """Indexed (3+1): the active setup's rotary angle; the program indexes before its passes."""
+        if angle is None:
+            angle, ok = QInputDialog.getDouble(self, "Rotary index", "Rotary angle for this setup (degrees):",
+                                               float(getattr(self.active_setup, "rotary_index_deg", 0.0)), -3600.0, 3600.0, 3)
+            if not ok:
+                return False
+        self._push_history("Rotary index")
+        self.active_setup.rotary_index_deg = float(angle)
+        self._mark_dirty()
+        self.terminal_core.log("info", f"{self.active_setup.name}: rotary index {float(angle):g}°.")
+        return True
+
+    def _rotary_letter(self) -> str:
+        machine = getattr(self, "current_machine", None)
+        if machine is None:
+            return "A"
+        device = machine.rotary_device()
+        if device is not None:
+            return device.axis
+        names = [n for n in machine.axis_names() if n in ("A", "B", "C")]
+        return names[0] if names else "A"
+
+    def _rotary_operation_segments(self, op, setup, segments) -> list:
+        """Wrap onto round stock, or turn an indexed setup into machine coordinates."""
+        from basicam.kinematics import KinematicSetup
+        from basicam.motion_guard import blocking, check_joint_move
+        from basicam.wrapping import index_segments, wrap_segments
+
+        machine = getattr(self, "current_machine", None)
+        letter = self._rotary_letter()
+        if bool(getattr(op, "wrap", False)) or (getattr(setup, "work_type", "") == "round" and str(op.kind) in ("Engrave", "Etch", "Trace", "Profile")):
+            spec = getattr(self, "stock_spec", None)
+            device = machine.rotary_device() if machine is not None else None
+            radius = float(spec.diameter) / 2.0 if spec is not None and spec.kind in ("bar", "tube") else (
+                float(device.clamp_diameter_mm) / 2.0 if device is not None else 10.0)
+            centre = device.centre_mm if device is not None else (0.0, 0.0, 0.0)
+            return wrap_segments(segments, radius, letter, (centre[1], centre[2]))
+        angle = float(getattr(setup, "rotary_index_deg", 0.0) or 0.0)
+        if abs(angle) > 1e-9 and machine is not None:
+            safe_z = float(getattr(setup, "safe_z_mm", 5.0)) + 10.0
+            moved = index_segments(segments, angle, KinematicSetup.of(machine), letter, safe_z)
+            first = moved[0].end
+            known = self.motion_guard.work_offset_known()
+            wco = self.motion_guard.work_offset() if known else (0.0, 0.0, 0.0)
+            start = {"X": first[0] + wco[0], "Y": first[1] + wco[1], "Z": first[2] + wco[2], letter: 0.0}
+            violations = check_joint_move(machine, self.motion_guard.tool(), start, dict(start, **{letter: angle}))
+            if not known:  # machine limits need the work offset: checked again before streaming
+                violations = [v for v in violations if v.axis == letter]
+            if blocking(violations):
+                raise ValueError("Index move refused:\n" + "\n".join(v.text() for v in violations[:5]))
+            return moved
+        return segments
+
+    # ------------------------------------------------------------ nesting (v2 Block 16)
+    def _nest_settings(self):
+        from basicam.nesting import NestSettings
+
+        spec = getattr(self, "stock_spec", None)
+        length, width, margin, origin = 1220.0, 2440.0, 5.0, (0.0, 0.0)
+        if spec is not None and spec.is_flat:
+            length, width, margin, origin = spec.length, spec.width, max(spec.margin, 0.0), (spec.origin_x, spec.origin_y)
+        machine = getattr(self, "current_machine", None)
+        spacing_default = 0.4
+        if machine is not None and machine.process in ("laser", "plasma", "waterjet", "wire_edm"):
+            from basicam.process_params import CutChart
+
+            thickness = float(spec.thickness) if spec is not None else 3.0
+            spacing_default = CutChart(self.settings).lookup(machine.process, self.stock_material.currentText(), thickness).part_spacing()
+        try:
+            spacing = float(self.settings.value("nest/spacing_mm", 0.0) or 0.0) or spacing_default
+        except (TypeError, ValueError):
+            spacing = spacing_default
+        allow = bool(self.settings.value("nest/allow_rotation", False, type=bool))
+        return NestSettings(sheet_length=length, sheet_width=width, margin=margin, spacing=spacing,
+                            allow_rotation=allow, rotation_steps=int(self.settings.value("nest/rotation_steps", 4) or 4),
+                            origin=origin)
+
+    def nest_parts_with_dialog(self, parts: list | None = None):
+        """Ask spacing and rotation for this nest (rotation off by default), then nest."""
+        settings = self._nest_settings()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Nest parts")
+        form = QFormLayout(dialog)
+        spacing = QDoubleSpinBox()
+        spacing.setRange(0.0, 100.0)
+        spacing.setDecimals(3)
+        spacing.setSuffix(" mm")
+        spacing.setValue(settings.spacing)
+        spacing.setToolTip("Gap between nested parts; defaults to twice the kerf / beam / jet width.")
+        form.addRow("Spacing", spacing)
+        rotate = QCheckBox("Allow rotation to fit more parts")
+        rotate.setChecked(settings.allow_rotation)
+        form.addRow("", rotate)
+        steps = QSpinBox()
+        steps.setRange(1, 72)
+        steps.setValue(settings.rotation_steps)
+        steps.setToolTip("4 = 0/90/180/270 degrees; more steps = finer free rotation.")
+        form.addRow("Rotation steps", steps)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        settings.spacing = float(spacing.value())
+        settings.allow_rotation = rotate.isChecked()
+        settings.rotation_steps = int(steps.value())
+        self.settings.setValue("nest/allow_rotation", settings.allow_rotation)
+        self.settings.setValue("nest/rotation_steps", settings.rotation_steps)
+        return self.nest_parts(parts, settings)
+
+    def nest_parts(self, parts: list | None = None, settings=None):
+        """Nest parts on sheet / plate stock (one undo step). Different materials or thicknesses
+        go on separate stocks; extra quantities are added as copies."""
+        from basicam.nesting import NestItem, footprint_of_mesh, nest_groups, placement_matrix
+        from basicam.stock import StockSpec, build_stock_mesh
+
+        targets = [p for p in (parts or self.parts) if p.role is not PartRole.STOCK and p.mesh is not None and p.mesh.n_cells]
+        if not targets:
+            self.statusBar().showMessage("Nothing to nest: import parts first.", 3000)
+            return None
+        settings = settings or self._nest_settings()
+        default_material = self.stock_material.currentText()
+        footprints, items = {}, []
+        for index, part in enumerate(targets):
+            key = f"{index}"
+            footprints[key] = footprint_of_mesh(part.mesh)
+            group = f"{part.material or default_material} · {part.thickness_mm or float(part.mesh.bounds[5] - part.mesh.bounds[4]):.3f} mm"
+            items.append(NestItem(key, footprints[key], max(1, int(part.quantity or 1)), bool(part.allow_rotation), False, group))
+        results = nest_groups(items, settings)
+        self._push_history("Nest parts")
+        lines = []
+        sheet_offset = 0
+        gap = 50.0
+        for result in results:
+            for placement in result.placements:
+                part = targets[int(placement.key)]
+                matrix = placement_matrix(footprints[placement.key], placement)
+                matrix[0, 3] += (sheet_offset + placement.sheet) * (settings.sheet_length + gap)
+                if placement.copy > 0:
+                    clone = PartModel(f"{part.name} ({placement.copy + 1})", part.mesh, part.source_path, imported=True,
+                                      brep_shape=part.brep_shape, solid_shape=part.solid_shape, edge_mesh=part.edge_mesh,
+                                      native_brep=part.native_brep, role=part.role)
+                    clone.material, clone.thickness_mm = part.material, part.thickness_mm
+                    self.parts.append(clone)
+                    part = clone
+                moved = transform_part(part, matrix)
+                part.mesh, part.edge_mesh = moved.mesh, moved.edge_mesh
+                part.brep_shape, part.solid_shape = moved.brep_shape, moved.solid_shape
+            for sheet in range(result.sheets):
+                spec = StockSpec(kind="sheet", length=settings.sheet_length, width=settings.sheet_width,
+                                 thickness=float(getattr(self.stock_spec, "thickness", 3.0) if getattr(self, "stock_spec", None) else 3.0),
+                                 material=result.group.split(" · ")[0], margin=settings.margin,
+                                 origin_x=settings.origin[0] + (sheet_offset + sheet) * (settings.sheet_length + gap),
+                                 origin_y=settings.origin[1], top_at_z0=self._sheet_top_at_z0())
+                if sheet_offset + sheet > 0:
+                    stock = PartModel(f"Stock · sheet {sheet_offset + sheet + 1}", build_stock_mesh(spec))
+                    stock.role = PartRole.STOCK
+                    self.parts.append(stock)
+            util = ", ".join(f"{u * 100.0:.1f}%" for u in result.utilisation)
+            lines.append(f"{result.group}: {len(result.placements)} placed on {result.sheets} sheet(s) ({util})"
+                         + (f"; {len(result.unplaced)} did not fit" if result.unplaced else ""))
+            sheet_offset += result.sheets
+        self.nest_results = results
+        self._refresh_parts()
+        self._refresh_scene(reset_camera=False)
+        summary = "\n".join(lines)
+        self.terminal_core.log("info", "Nesting: " + summary.replace("\n", " | "))
+        QMessageBox.information(self, "Nesting", summary)
+        return results
+
+    # ------------------------------------------------------------ job type (v2 Block 15)
+    def _maybe_ask_job_type(self, op_kind: str | None = None) -> str | None:
+        from basicam.job_type import needs_prompt
+
+        machine = getattr(self, "current_machine", None)
+        process = machine.process if machine is not None else "mill"
+        setup = self.active_setup
+        if not needs_prompt(process, op_kind, getattr(setup, "work_type", "")):
+            return getattr(setup, "work_type", "") or None
+        return self.ask_job_type()
+
+    def ask_job_type(self, answer: str | None = None) -> str | None:
+        """What is the work? Flat, Round or On a 3D object; then supply what is missing."""
+        from basicam.job_type import WORK_TYPES
+
+        if answer is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("What is the work?")
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(QLabel("What is this job cut or engraved on?"))
+            chosen = {"value": None}
+            for key, label in WORK_TYPES.items():
+                button = QPushButton(label)
+                button.clicked.connect(lambda _c=False, k=key: (chosen.update(value=k), dialog.accept()))
+                layout.addWidget(button)
+            if dialog.exec() != QDialog.DialogCode.Accepted or chosen["value"] is None:
+                return None
+            answer = chosen["value"]
+        setup = self.active_setup
+        setup.work_type = answer
+        self._mark_dirty()
+        if answer == "flat":
+            spec = getattr(self, "stock_spec", None)
+            if spec is None or not spec.is_flat:
+                thickness = float(self._stock_dims_mm().get("Z", 3.0))
+                self.apply_stock_spec(StockSpec(kind="sheet", length=600.0, width=400.0, thickness=thickness,
+                                                material=self.stock_material.currentText()))
+                self.define_stock()  # confirm / edit the sheet or plate
+        elif answer == "round":
+            device = self.ensure_rotary_device()
+            if device is None:
+                self.terminal_core.log("warning", "Round work needs a rotary device; set it up under Machines > Rotary axis setup.")
+            spec = getattr(self, "stock_spec", None)
+            if spec is None or spec.kind not in ("bar", "tube"):
+                diameter = float(device.clamp_diameter_mm) if device is not None else 25.0
+                self.apply_stock_spec(StockSpec(kind="bar", length=100.0, diameter=diameter, material=self.stock_material.currentText()))
+        elif answer == "surface":
+            if self.selected_features:
+                part_index = sorted(self.selected_features)[0][0]
+                setup.work_surface = {"part": part_index, "features": sorted(f for p, f in self.selected_features if p == part_index)}
+            else:
+                self.terminal_core.log("info", "On a 3D object: select the surface in the view, then choose the work type again.")
+        self.terminal_core.log("info", f"Work type: {WORK_TYPES.get(answer, answer)}.")
+        return answer
+
+    def _surface_height_function(self, setup):
+        """height_at(x, y) of the setup's selected surface (ray cast from above), or None."""
+        info = getattr(setup, "work_surface", None) or {}
+        if "part" not in info:
+            return None
+        mesh = self._surface_mesh_for(int(info["part"]), list(info.get("features", [])))
+        if mesh is None or mesh.n_points == 0:
+            return None
+        top = float(mesh.bounds[5]) + 10.0
+        bottom = float(mesh.bounds[4]) - 10.0
+
+        def height_at(x: float, y: float):
+            points, _ids = mesh.ray_trace((x, y, top), (x, y, bottom), first_point=True)
+            return float(points[2]) if len(points) else None
+
+        return height_at
+
+    # ------------------------------------------------------------ rotary devices (v2 Block 14)
+    def ensure_rotary_device(self):
+        """The active machine's rotary device; opens the rotary setup when it has none."""
+        machine = getattr(self, "current_machine", None)
+        if machine is None:
+            QMessageBox.information(self, "Rotary axis", "Choose a machine first (Tools > Tool inventory > Machines).")
+            return None
+        device = machine.rotary_device()
+        if device is not None:
+            return device
+        dialog = RotaryDeviceDialog(None, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        machine.rotary_devices.append(dialog.device)
+        machine.active_rotary = len(machine.rotary_devices) - 1
+        if hasattr(self, "machine_store"):
+            self.machine_store.save(machine)
+        self.terminal_core.log("info", f"Rotary device '{dialog.device.name}' added to {machine.name}.")
+        self._refresh_scene(reset_camera=False)
+        return dialog.device
+
+    def _draw_rotary_device(self) -> None:
+        """Chuck / collet / rollers / tailstock of the active rotary device, in the keep-out colour."""
+        machine = getattr(self, "current_machine", None)
+        device = machine.rotary_device() if machine is not None else None
+        if device is None or not bool(self.settings.value("view/rotary_device", True, type=bool)):
+            return
+        from basicam.rotary_devices import body_meshes
+
+        for index, (name, mesh) in enumerate(body_meshes(device)):
+            keepout = name.startswith(("Jaw", "Chuck", "Collet", "Tailstock", "Steady"))
+            self.plotter.add_mesh(
+                mesh, color=theme_color("keepout") if keepout else theme_color("reference"), opacity=0.55,
+                name=f"rotary-body-{index}", pickable=False,
+            )
+
+    # ------------------------------------------------------------ 2D cutting (v2 Block 13)
+    def _process_params_for(self, op):
+        from basicam.process_params import CutChart, ProcessParams
+
+        machine = getattr(self, "current_machine", None)
+        process = machine.process if machine is not None else "laser"
+        if getattr(op, "process_params", None):
+            params = ProcessParams.from_dict(op.process_params)
+            params.process = process if process in ("laser", "plasma", "waterjet", "wire_edm") else params.process
+            return params
+        thickness = float(self.stock_spec.thickness) if getattr(self, "stock_spec", None) is not None else float(op.depth_mm)
+        return CutChart(self.settings).lookup(process, self.stock_material.currentText(), thickness)
+
+    def _beam_commands(self, params) -> tuple[list[str], list[str]]:
+        if params.process == "laser":
+            power = int(round(10.0 * max(0.0, min(100.0, params.power_pct))))  # GRBL S0-1000 ($30=1000)
+            return ([f"{'M4' if params.dynamic_power else 'M3'} S{power}"], ["M5"])
+        if params.process in ("plasma", "waterjet"):
+            return (["M3"], ["M5"])
+        return ([], [])  # wire EDM: the wire runs for the whole program
+
+    def _stock_polygon_xy(self):
+        from shapely.geometry import box
+
+        spec = getattr(self, "stock_spec", None)
+        if spec is not None:
+            sx, sy, _sz = spec.size()
+            return box(spec.origin_x, spec.origin_y, spec.origin_x + sx, spec.origin_y + sy)
+        mesh = getattr(self, "stock_mesh", None)
+        if mesh is not None and mesh.n_points:
+            b = mesh.bounds
+            return box(b[0], b[2], b[1], b[3])
+        return None
+
+    def _cut_operation_segments(self, op) -> list:
+        """Laser / plasma / waterjet / wire EDM cut of the target's sketch: kerf compensation,
+        safe leads, tabs or micro-joints, pierces off the contour, inside-first cut order,
+        optional flash cutting; the beam is never on during a rapid or outside the stock."""
+        from shapely.geometry import Polygon
+
+        from basicam.contours import build_contours
+        from basicam.cut_features import (
+            beam_violations, compensate, cut_segments, flash_rows, order_cuts, plan_leads, tab_intervals, taper_kerf,
+        )
+
+        feat = next((f for f in self.sketch_workflow.features if op.target in (f.name, f.feature_id)), None)
+        if feat is None or feat.has_error or feat.state != "defined":
+            return []
+        group = [f for f in self.sketch_workflow.features if (f.owner_sketch_id or "_") == (feat.owner_sketch_id or "_") and not f.has_error]
+        contours = build_contours(group)
+
+        def xy(coords):
+            return [(x, y) for x, y, _z in contours.to_world(coords)]
+
+        regions = [Polygon(xy(r.exterior.coords), [xy(i.coords) for i in r.interiors]) for r in contours.regions]
+        # nested faces from polygonize: a hole's own face is not a separate part
+        parts = [r for r in regions if not any(o is not r and o.contains(r.representative_point()) and o.area > r.area for o in regions)]
+        params = self._process_params_for(op)
+        kerf = taper_kerf(params.effective_kerf, params.thickness_mm, params.taper_deg, params.good_side)
+        outlines = [Polygon(p.exterior) for p in parts]
+        sequence = order_cuts([(list(p.exterior.coords), [list(i.coords) for i in p.interiors]) for p in parts])
+        machine = getattr(self, "current_machine", None)
+        flash = bool(params.flash_cut and params.process == "laser" and machine is not None and machine.fast_beam_gating)
+        plans, tabs, problems = [], {}, []
+        flash_features = []
+        stock_area = self._stock_polygon_xy()
+        for part_index, role, ring in sequence:
+            is_hole = role == "inner"
+            if flash and is_hole:
+                flash_features.append(ring)
+                continue
+            path = compensate(ring, is_hole, kerf)
+            if not path:
+                problems.append(f"A contour of part {part_index + 1} is smaller than the kerf.")
+                continue
+            neighbours = [o for i, o in enumerate(outlines) if i != part_index]
+            own = [Polygon(r) for r in [list(parts[part_index].exterior.coords)] + [list(i.coords) for i in parts[part_index].interiors] if r != ring]
+            plan = plan_leads(path, is_hole, kerf, params.lead_type, params.lead_in_mm, params.lead_out_mm, params.overcut_mm,
+                              neighbours=neighbours, own_features=own, safety=params.lead_safety_mm,
+                              within=stock_area)
+            if not plan.ok:
+                x, y = plan.location
+                problems.append(f"{plan.message} At X{x:.3f} Y{y:.3f}.")
+                continue
+            if role == "outer" and (params.tab_count > 0 or params.tab_spacing_mm > 0):
+                tabs[len(plans)] = tab_intervals(plan.ring, params.tab_width(), params.tab_count, params.tab_spacing_mm, keep_clear=[plan.ring[0]])
+            plans.append(plan)
+        if flash_features:
+            rows, flagged = flash_rows(flash_features, params.feed_mm_min, machine.min_gate_s if machine else 0.002)
+            for f in flagged:
+                c = Polygon(f).centroid
+                self.terminal_core.log("warning", f"Flash cut: feature at X{c.x:.3f} Y{c.y:.3f} is too small or too close to gate reliably.")
+            from basicam.cut_features import LeadPlan
+
+            flash_plans = [LeadPlan(compensate(f, True, kerf)) for row in rows for f in row.features]
+            plans = [p for p in flash_plans if len(p.ring) >= 2] + plans
+        if problems:
+            raise ValueError("Cut not generated:\n" + "\n".join(problems))
+        beam_on, beam_off = self._beam_commands(params)
+        top = float(self.stock_spec.thickness) if getattr(self, "stock_spec", None) is not None and not self._sheet_top_at_z0() else 0.0
+        segments = cut_segments(plans, params, beam_on, beam_off, z_top=top, safe_z=top + 5.0, tabs=tabs,
+                                op_meta={"op": op.name, "tool": op.tool}, flash=False)
+        if flash and flash_features:
+            segments = cut_segments(plans[: len(flash_plans)], params, beam_on, beam_off, z_top=top, safe_z=top + 5.0,
+                                    op_meta={"op": op.name, "tool": op.tool}, flash=True) + cut_segments(
+                plans[len(flash_plans):], params, beam_on, beam_off, z_top=top, safe_z=top + 5.0, tabs=tabs,
+                op_meta={"op": op.name, "tool": op.tool})
+        unsafe = beam_violations(segments, self._stock_polygon_xy())
+        if unsafe:
+            raise ValueError("Cut refused (beam safety):\n" + "\n".join(unsafe[:10]))
+        return segments
+
+    def test_fire(self) -> bool:
+        """Laser Test fire at low power; needs the laser_test_fire gate (starts OFF)."""
+        machine = getattr(self, "current_machine", None)
+        if machine is None or machine.process not in ("laser", "rotary_laser", "laser_lathe"):
+            self.statusBar().showMessage("Test fire is for laser machines.", 3000)
+            return False
+        if not self.safety.allows("laser_test_fire"):
+            self.statusBar().showMessage("Test fire is switched off (Options > Safety: Allow laser Test fire).", 5000)
+            return False
+        if self.grbl_controller is None or self._program_running():
+            self.statusBar().showMessage("Connect the laser and stop any program first.", 3000)
+            return False
+        for line in ("M3 S10", "G4 P0.1", "M5"):  # 1% power for 0.1 s
+            self.grbl_controller.send_line(line)
+            self.terminal_core.log("command", line)
+        return True
+
+    # ------------------------------------------------------------ auxiliaries & usage (v2 Block 12)
+    def _material_family(self) -> str:
+        store = getattr(self, "material_store", None)
+        material = store.get(self.stock_material.currentText()) if store is not None else None
+        return material.family if material is not None else ""
+
+    def _default_aux(self) -> list[str]:
+        machine = getattr(self, "current_machine", None)
+        process = machine.process if machine is not None else "mill"
+        return default_aux_for(process, self._material_family())
+
+    def _operation_aux(self, op) -> list[str]:
+        kinds = list(getattr(op, "aux", []) or [])
+        if not kinds and bool(getattr(op, "coolant", False)):
+            kinds = ["flood"]  # older projects: the coolant flag means flood coolant
+        return kinds
+
+    def _build_aux_usage_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.addWidget(QLabel("Auxiliaries"))
+        self.aux_buttons_row = QHBoxLayout()
+        layout.addLayout(self.aux_buttons_row)
+        layout.addWidget(QLabel("Usage (this machine)"))
+        self.usage_table = QTableWidget(0, 3)
+        self.usage_table.setHorizontalHeaderLabels(["Item", "Total", "Maintenance at"])
+        layout.addWidget(self.usage_table, 1)
+        row = QHBoxLayout()
+        save = QPushButton("Save thresholds")
+        save.clicked.connect(self._save_usage_thresholds)
+        reset = QPushButton("Reset counter")
+        reset.setToolTip("Set the selected item back to zero (after cleaning or replacing it); the reset is logged.")
+        reset.clicked.connect(self._reset_selected_usage)
+        row.addWidget(save)
+        row.addWidget(reset)
+        layout.addLayout(row)
+        self.job_usage_label = QLabel("")
+        self.job_usage_label.setWordWrap(True)
+        self.job_usage_label.setObjectName("mutedText")
+        layout.addWidget(self.job_usage_label)
+        self._refresh_aux_usage_panel()
+        return panel
+
+    def _usage_store(self) -> UsageStore:
+        return UsageStore(self.settings)
+
+    def _refresh_aux_usage_panel(self) -> None:
+        if not hasattr(self, "usage_table"):
+            return
+        while self.aux_buttons_row.count():
+            item = self.aux_buttons_row.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        machine = getattr(self, "current_machine", None)
+        for output in (machine.aux_output_list() if machine is not None else []):
+            button = QPushButton(AUX_KINDS.get(output.kind, output.kind).split(" (")[0])
+            button.setCheckable(True)
+            button.toggled.connect(lambda on, k=output.kind: self.toggle_aux(k, on))
+            self.aux_buttons_row.addWidget(button)
+        self.usage_table.setRowCount(0)
+        if machine is None:
+            return
+        usage = self._usage_store().get(machine.machine_id)
+        from basicam.usage_tracking import PROCESS_ITEMS
+
+        for key in PROCESS_ITEMS.get(machine.process, PROCESS_ITEMS["mill"]):
+            label, unit = USAGE_ITEMS.get(key, (key, ""))
+            r = self.usage_table.rowCount()
+            self.usage_table.insertRow(r)
+            name_item = QTableWidgetItem(label)
+            name_item.setData(Qt.ItemDataRole.UserRole, key)
+            value = usage.counters.get(key, 0.0)
+            value_item = QTableWidgetItem(f"{value:.3f} {unit}".strip())
+            limit = usage.thresholds.get(key, 0.0)
+            if limit and value >= limit:
+                value_item.setForeground(QColor(theme_color("warning")))
+            self.usage_table.setItem(r, 0, name_item)
+            self.usage_table.setItem(r, 1, value_item)
+            self.usage_table.setItem(r, 2, QTableWidgetItem(f"{limit:g}" if limit else ""))
+
+    def _save_usage_thresholds(self) -> None:
+        machine = getattr(self, "current_machine", None)
+        if machine is None:
+            return
+        store = self._usage_store()
+        usage = store.get(machine.machine_id)
+        for r in range(self.usage_table.rowCount()):
+            key = self.usage_table.item(r, 0).data(Qt.ItemDataRole.UserRole)
+            text = (self.usage_table.item(r, 2).text() if self.usage_table.item(r, 2) else "").strip()
+            try:
+                usage.thresholds[key] = float(text) if text else 0.0
+            except ValueError:
+                continue
+        store.save(machine.machine_id, usage)
+        self._refresh_aux_usage_panel()
+
+    def _reset_selected_usage(self) -> None:
+        machine = getattr(self, "current_machine", None)
+        rows = {i.row() for i in self.usage_table.selectedItems()}
+        if machine is None or not rows:
+            return
+        store = self._usage_store()
+        usage = store.get(machine.machine_id)
+        for r in rows:
+            usage.reset(self.usage_table.item(r, 0).data(Qt.ItemDataRole.UserRole))
+        store.save(machine.machine_id, usage)
+        self._refresh_aux_usage_panel()
+
+    def toggle_aux(self, kind: str, on: bool) -> bool:
+        """Switch an auxiliary by hand; refused while a program is running."""
+        if self._program_running():
+            self.statusBar().showMessage("Auxiliaries are switched by the program while it runs.", 4000)
+            return False
+        machine = getattr(self, "current_machine", None)
+        lines = aux_lines(machine.aux_output_list() if machine is not None else [], [kind], on)
+        if self.grbl_controller is None:
+            self.statusBar().showMessage("Connect the machine first.", 3000)
+            return False
+        for line in lines:
+            if not line.startswith("G4"):
+                self.grbl_controller.send_line(line)
+                self.terminal_core.log("command", line)
+        return True
+
+    def _record_usage(self, lines: list[str]) -> JobUsage | None:
+        """Count the streamed program into this job and the machine's totals (maintenance warnings)."""
+        machine = getattr(self, "current_machine", None)
+        if machine is None or not lines:
+            return None
+        usage = usage_from_program(lines, machine.process)
+        job = getattr(self, "job_usage", None) or JobUsage()
+        job.add(usage)
+        self.job_usage = job
+        store = self._usage_store()
+        totals = store.get(machine.machine_id)
+        for warning in totals.add(usage):
+            self.terminal_core.log("warning", warning)
+            self.statusBar().showMessage(warning, 8000)
+        store.save(machine.machine_id, totals)
+        self.terminal_core.log("info", f"Job usage: {format_usage(usage)}.")
+        if hasattr(self, "job_usage_label"):
+            self.job_usage_label.setText(f"This job: {format_usage(job)}")
+        self._refresh_aux_usage_panel()
+        return usage
+
+    # ------------------------------------------------------------ tool table (v2 Block 11)
+    def _tool_changer_and_table(self):
+        machine = getattr(self, "current_machine", None)
+        if machine is None:
+            return ToolChanger(), ToolTable()
+        return machine.tool_changer, machine.tool_table
+
+    def _build_tool_table_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        self.tool_table_status = QLabel("")
+        self.tool_table_status.setObjectName("mutedText")
+        self.tool_table_status.setWordWrap(True)
+        layout.addWidget(self.tool_table_status)
+        self.tool_table_widget = QTableWidget(0, 2)
+        self.tool_table_widget.setHorizontalHeaderLabels(["Pocket", "Tool"])
+        layout.addWidget(self.tool_table_widget, 1)
+        row = QHBoxLayout()
+        self.tool_table_pocket = QSpinBox()
+        self.tool_table_pocket.setRange(1, 999)
+        self.tool_table_tool = QComboBox()
+        load = QPushButton("Load")
+        load.setToolTip("Put the chosen inventory tool in this pocket (machine stopped).")
+        load.clicked.connect(lambda: self.load_tool_pocket(self.tool_table_pocket.value(), self.tool_table_tool.currentText()))
+        unload = QPushButton("Unload")
+        unload.clicked.connect(lambda: self.load_tool_pocket(self.tool_table_pocket.value(), ""))
+        for widget in (QLabel("Pocket"), self.tool_table_pocket, self.tool_table_tool, load, unload):
+            row.addWidget(widget)
+        layout.addLayout(row)
+        self._refresh_tool_table_panel()
+        return panel
+
+    def _refresh_tool_table_panel(self) -> None:
+        if not hasattr(self, "tool_table_widget"):
+            return
+        changer, table = self._tool_changer_and_table()
+        self.tool_table_tool.clear()
+        self.tool_table_tool.addItems([t.name for t in getattr(self, "tools", [])])
+        self.tool_table_widget.setRowCount(0)
+        for number, entry in sorted(table.pockets.items()):
+            r = self.tool_table_widget.rowCount()
+            self.tool_table_widget.insertRow(r)
+            self.tool_table_widget.setItem(r, 0, QTableWidgetItem(str(number)))
+            self.tool_table_widget.setItem(r, 1, QTableWidgetItem(entry.tool))
+        if changer.automatic:
+            self.tool_table_status.setText(f"{changer.kind.capitalize()} tool changer · {changer.pockets} pockets · change {changer.time_s():g} s")
+        else:
+            self.tool_table_status.setText("No tool changer: tool changes pause the program (M0) for a manual change.")
+
+    def load_tool_pocket(self, pocket: int, tool_name: str) -> bool:
+        """Edit the tool table; refused while a program is running (the machine must be stopped)."""
+        machine = getattr(self, "current_machine", None)
+        if machine is None:
+            self.statusBar().showMessage("Choose a machine first.", 3000)
+            return False
+        if self._program_running():
+            self.statusBar().showMessage("Stop the machine and spindle before changing the tool table.", 4000)
+            return False
+        changer = machine.tool_changer
+        if changer.automatic and not 1 <= int(pocket) <= int(changer.pockets):
+            self.statusBar().showMessage(f"The tool changer has pockets 1 to {changer.pockets}.", 4000)
+            return False
+        if tool_name:
+            machine.tool_table.load(int(pocket), tool_name)
+        else:
+            machine.tool_table.unload(int(pocket))
+        if hasattr(self, "machine_store") and self.machine_store.get(machine.machine_id) is not None:
+            self.machine_store.save(machine)
+        self._refresh_tool_table_panel()
+        return True
 
     def _refresh_machine_ports(self) -> None:
         current_port = self.port_combo.currentData()
@@ -2207,6 +3407,20 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 self.position_verified_box.setChecked(False)
                 self._update_dro_readout()
         self.grbl_capabilities = parse_grbl_capabilities(self.grbl_identification_lines)
+        machine = getattr(self, "current_machine", None)
+        if machine is not None and self.grbl_capabilities is not None:
+            reported = self.grbl_capabilities.axes or "XYZ"
+            missing = [a for a in machine.axis_names() if a not in reported]
+            if missing and not getattr(self, "_axis_mismatch_logged", False):
+                self._axis_mismatch_logged = True
+                self.terminal_core.log(
+                    "error",
+                    f"The controller reports axes {reported}; {machine.name} needs {', '.join(missing)}. "
+                    "Motion is refused until the controller and the machine profile match.",
+                )
+            if missing:
+                self.preflight_complete = False
+                self._preflight_pending = False
         identified = self.grbl_capabilities is not None and self.grbl_capabilities.version.startswith("1.1")
         state = self.grbl_status.state.casefold() if self.grbl_status is not None else ""
         if identified and getattr(self, "_preflight_pending", False) and not state.startswith("alarm"):
@@ -2497,7 +3711,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         spindle = self.grbl_status.spindle_rpm or 0.0
         return state in {"idle", "alarm", "hold:0", "door:0", "sleep"} and spindle <= 0.0
 
-    def start_program_stream(self, lines: list[str], label: str, start_line: int = 1, editor=None, start_state=None) -> bool:
+    def start_program_stream(self, lines: list[str], label: str, start_line: int = 1, editor=None, start_state=None, confirm: bool = True) -> bool:
         """Stream a program with a full motion-guard pre-check before the first line is sent."""
         if self._program_running():
             QMessageBox.warning(self, label, "A program is already running.")
@@ -2512,9 +3726,18 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if violations:
             self.motion_guard.report(violations, label)
             return False
-        dialog = StartDisclaimerDialog(label, f"{label}: {len(lines)} lines from line {start_line}.", self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return False
+        machine = getattr(self, "current_machine", None)
+        if machine is not None:
+            pins = self.grbl_status.pins if getattr(self, "grbl_status", None) is not None else ""
+            absent = missing_required(machine.aux_output_list(), getattr(self, "_program_aux_kinds", []), pins)
+            if absent:
+                self.terminal_core.log("error", f"{label} refused: required auxiliary not running: {', '.join(absent)}.")
+                QMessageBox.warning(self, label, "Required auxiliary not running: " + ", ".join(absent) + ".")
+                return False
+        if confirm:  # production-run repeats were confirmed once, at the start of the run
+            dialog = StartDisclaimerDialog(label, f"{label}: {len(lines)} lines from line {start_line}.", self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
         program = [l for l in lines]
         self.stream_lines = program
         self.stream_index = 0
@@ -2564,6 +3787,11 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.program_running = False
         self.streaming_program = False
         self.stream_waiting = False
+        self._record_usage(list(getattr(self, "stream_lines", []))[: getattr(self, "stream_index", 0)])
+        if completed and getattr(self, "production", None) is not None:
+            QTimer.singleShot(0, self._production_next)
+        elif not completed:
+            self.production = None  # a stopped run never loops on its own
         self._mark_dirty()  # progress is saved with the project for a resume suggestion
         self.terminal_core.log("info" if completed else "warning", "Program finished." if completed else
                                f"Program stopped; resume is suggested from line {self.gcode_progress.get('acked', 0) + 1}.")
@@ -2675,7 +3903,35 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.ghost_path = None
         return True
 
+    def _send_rotary_jog(self, request: MoveRequest) -> bool:
+        """[ and ] turn the rotary axis; guarded like every move (rotary limits, swing into keep-outs)."""
+        from basicam.motion_guard import check_joint_move
+
+        machine = getattr(self, "current_machine", None)
+        letter = self._rotary_letter()
+        if machine is None or letter not in machine.axis_names():
+            self.statusBar().showMessage("This machine has no rotary axis.", 3000)
+            return False
+        here = getattr(self, "rotary_position", {}) or {}
+        x, y, z = (tuple(self.tracked_work_pos) + (0.0, 0.0, 0.0))[:3]
+        start = {"X": x, "Y": y, "Z": z, letter: float(here.get(letter, 0.0))}
+        end = dict(start, **{letter: start[letter] + float(request.distance)})
+        violations = check_joint_move(machine, self.motion_guard.tool(), start, end)
+        if not self.motion_guard.report(violations, "Keyboard rotary move"):
+            return False
+        if not self.keyboard_virtual_box.isChecked():
+            if self.grbl_controller is None:
+                self.terminal_core.log("warning", "No machine connected; nothing was sent.")
+                return False
+            self.grbl_controller.send_line(f"$J=G91 {letter}{float(request.distance):.3f} F{float(request.feed) * 10.0:.0f}")
+        self.rotary_position = dict(here, **{letter: end[letter]})
+        self.terminal_core.log("info", f"Rotary {letter}{float(request.distance):+.3f}° -> {end[letter]:.3f}°")
+        return True
+
     def _preview_keyboard_move(self, request: MoveRequest) -> None:
+        if request.axis not in ("X", "Y", "Z"):
+            self.statusBar().showMessage(f"Rotary {self._rotary_letter()} {request.distance:+.3f}° (Enter sends)", 3000)
+            return
         start = tuple(self.tracked_work_pos)
         end = list(start)
         end[{"X": 0, "Y": 1, "Z": 2}[request.axis]] += request.distance
@@ -2685,6 +3941,22 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
 
     def _send_keyboard_move(self, request: MoveRequest) -> bool:
         """Guard, confirm, then send (real) or move the ghost (virtual); always logged."""
+        if request.axis not in ("X", "Y", "Z"):
+            return self._send_rotary_jog(request)
+        if self._is_lathe() and request.axis in ("X", "Z"):
+            from basicam.cam_dynamics_post import ToolpathSegment
+
+            x, _y, z = (tuple(self.tracked_work_pos) + (0.0, 0.0, 0.0))[:3]
+            scale = 0.5 if getattr(self.current_machine, "diameter_mode", True) else 1.0
+            nx, nz = (x + request.distance, z) if request.axis == "X" else (x, z + request.distance)
+            move = ToolpathSegment("cut" if request.is_cut else "rapid", (x * scale, 0.0, z), (nx * scale, 0.0, nz), request.feed, 0,
+                                   {"lathe": True, "tool": getattr(self.motion_guard.tool(), "name", "")})
+            problems = self.lathe_violations([move])
+            if problems:
+                for problem in problems:
+                    self.terminal_core.log("error", f"Keyboard move refused: {problem.text}")
+                self.statusBar().showMessage(problems[0].text, 5000)
+                return False
         violations = self.motion_guard.check_jog(request.axis, request.distance)
         if not self.motion_guard.report(violations, "Keyboard move"):
             self.ghost_path = None
@@ -3412,6 +4684,23 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         dwg_row.addWidget(dwg_path, 1)
         dwg_row.addWidget(dwg_browse)
         form.addRow("DWG converter", dwg_row)
+        part_gap = QDoubleSpinBox()
+        part_gap.setRange(0.0, 1000.0)
+        part_gap.setDecimals(2)
+        part_gap.setSuffix(" mm")
+        part_gap.setValue(self._part_gap_mm())
+        part_gap.setToolTip("Gap left between a newly imported part and the parts already in the workspace.")
+        form.addRow("Import · gap beside parts", part_gap)
+        snap_px = QSpinBox()
+        snap_px.setRange(2, 50)
+        snap_px.setSuffix(" px")
+        snap_px.setValue(int(round(self._snap_radius_px())))
+        snap_px.setToolTip("How close the cursor must be, on screen, to snap to a point, edge or vertex.")
+        form.addRow("Sketch · snap radius", snap_px)
+        sheet_top = QCheckBox("Sheet and plate top at Z0")
+        sheet_top.setChecked(self._sheet_top_at_z0())
+        sheet_top.setToolTip("On: Z = 0 is the top of a sheet or plate (usual for laser, plasma and waterjet). Off: the bottom.")
+        form.addRow("Stock", sheet_top)
         colour_group, pending_colours = self._build_colour_overrides_group(dialog)
         form.addRow(colour_group)
         buttons = QDialogButtonBox(
@@ -3425,6 +4714,9 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.settings.setValue("interface/grid_font_px", grid_font.value())
             self.settings.setValue("import/dwg_converter", dwg_path.text().strip())
             set_dwg_converter(dwg_path.text().strip())
+            self.settings.setValue("import/part_gap_mm", float(part_gap.value()))
+            self.settings.setValue("sketch/snap_radius_px", int(snap_px.value()))
+            self.settings.setValue("stock/sheet_top_at_z0", sheet_top.isChecked())
             for token, value in pending_colours.items():
                 self.settings.setValue(f"colors/{token}", value)
             self._apply_theme()
@@ -3459,7 +4751,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             if not chosen.isValid():
                 return
             value = chosen.name()
-            if token != "error" and is_red(value):
+            if token not in ("error", "keepout") and is_red(value):
                 QMessageBox.information(parent, "Colours", "Red is reserved for errors; choose another colour.")
                 return
             pending[token] = value
@@ -3619,26 +4911,27 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             stock_form.addRow(f"{axis} size", field)
         layout.addLayout(stock_form)
         self.stock_material = QComboBox()
+        store = getattr(self, "material_store", None)
         self.stock_material.addItems(
-            [
-                "Unspecified",
-                "Wood (soft)",
-                "Wood (hard)",
-                "Plastic",
-                "Aluminum",
-                "Brass",
-                "Bronze",
-                "Mild steel",
-                "Stainless steel",
-                "Other",
+            store.names() if store is not None else [
+                "Unspecified", "Wood (soft)", "Wood (hard)", "Plastic", "Aluminum", "Brass",
+                "Bronze", "Mild steel", "Stainless steel", "Other",
             ]
         )
         self.stock_material.currentTextChanged.connect(self._apply_recommended_defaults)
         layout.addWidget(self.stock_material)
+        self.stock_kind_label = QLabel("Stock type: block (from part bounds)")
+        self.stock_kind_label.setObjectName("mutedText")
+        self.stock_kind_label.setWordWrap(True)
+        layout.addWidget(self.stock_kind_label)
         stock_actions = QHBoxLayout()
         create_stock = QPushButton("Create box")
         create_stock.clicked.connect(self.create_stock_box)
         stock_actions.addWidget(create_stock)
+        define_stock = QPushButton("Stock...")
+        define_stock.setToolTip("Define the stock type and size: block, sheet, plate, bar or tube.")
+        define_stock.clicked.connect(self.define_stock)
+        stock_actions.addWidget(define_stock)
         import_stock = QPushButton("Import billet")
         import_stock.clicked.connect(self.open_stock)
         stock_actions.addWidget(import_stock)
@@ -3809,6 +5102,9 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         ("Circle", "Circle", ("Center", "3 point")),
         ("Curve", "Curve", ("3 point arc", "Center arc")),
         ("Spline", "Spline", ("Fit points",)),
+        ("Slot", "Slot", ("Straight",)),
+        ("Polygon", "Polygon", ("6 sides", "3 sides", "4 sides", "5 sides", "8 sides")),
+        ("Centerline", "Centerline", ("Two point",)),
     )
     SNAP_OPTIONS = ("Grid", "Endpoint", "Midpoint", "Center", "Intersection", "On surface")
 
@@ -3878,7 +5174,15 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.finish_spline_btn.hide()
         variant_row.addWidget(self.finish_spline_btn)
         tools_layout.addLayout(variant_row)
+        self.smart_dimension_btn = QPushButton("Smart Dimension")
+        self.smart_dimension_btn.setCheckable(True)
+        self.smart_dimension_btn.setToolTip(
+            "Pick one or two entities, then click where the dimension goes and type its value (D)."
+        )
+        self.smart_dimension_btn.toggled.connect(self._toggle_dimension_tool)
+        tools_layout.addWidget(self.smart_dimension_btn)
         layout.addWidget(self.sketch_tools_box)
+        layout.addWidget(self._build_modify_group())
 
         # ---- options: construction + snaps
         self.sketch_options_box = QGroupBox("Options")
@@ -3960,8 +5264,449 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.sketch_error_banner.setWordWrap(True)
         self.sketch_error_banner.hide()
         layout.addWidget(self.sketch_error_banner)
+        layout.addWidget(self._build_relations_panel())
         self._select_sketch_tool("Line")
         return tab
+
+    # ------------------------------------------------------------ Modify tools (v2 Block 7)
+    def _build_modify_group(self) -> QGroupBox:
+        box = QGroupBox("Modify")
+        grid = QGridLayout(box)
+        grid.setSpacing(6)
+        self.modify_buttons: dict[str, QPushButton] = {}
+        entries = (
+            ("trim", "Trim", "Click a segment between intersections to remove it; drag across segments to trim several."),
+            ("extend", "Extend", "Click near a line end to extend it to the next entity."),
+            ("offset", "Offset...", "Offset the selected lines, rectangle or circle."),
+            ("mirror", "Mirror", "Mirror the selected entities about the selected centerline."),
+            ("fillet", "Fillet...", "Round the corner of two selected lines."),
+            ("chamfer", "Chamfer...", "Cut the corner of two selected lines."),
+            ("convert", "Convert Entities", "Copy the selected model face's outline into the sketch, tied to the model."),
+            ("move", "Move/Copy...", "Move or copy the selected entities by a distance."),
+            ("fully_define", "Fully Define", "Add the relations and dimensions this sketch still needs."),
+        )
+        for index, (key, label, tip) in enumerate(entries):
+            button = QPushButton(label)
+            button.setToolTip(tip)
+            if key in ("trim", "extend"):
+                button.setCheckable(True)
+                button.toggled.connect(lambda on, k=key: self._set_modify_mode(k if on else None))
+            else:
+                button.clicked.connect(lambda _c=False, k=key: self._run_modify(k))
+            self.modify_buttons[key] = button
+            grid.addWidget(button, index // 3, index % 3)
+        self._modify_mode: str | None = None
+        return box
+
+    def _set_modify_mode(self, mode: str | None) -> None:
+        self._modify_mode = mode
+        for key in ("trim", "extend"):
+            button = self.modify_buttons.get(key)
+            if button is not None and button.isChecked() != (key == mode):
+                button.blockSignals(True)
+                button.setChecked(key == mode)
+                button.blockSignals(False)
+        if mode:
+            group = self.sketch_tool_group
+            if group.checkedButton() is not None:
+                group.setExclusive(False)
+                group.checkedButton().setChecked(False)
+                group.setExclusive(True)
+            self.pending_sketch_points.clear()
+            self.sketch_chain.reset()
+            if getattr(self, "smart_dimension_btn", None) is not None:
+                self.smart_dimension_btn.setChecked(False)
+
+    def _editable_features(self) -> list:
+        return [f for f in self.sketch_workflow.features if self.sketch_workflow.can_edit(f)]
+
+    def _apply_edit(self, result, label: str) -> list:
+        """Apply a sketch_tools.EditResult as one undo step; returns the new entities."""
+        if result is None or result.empty:
+            if result is not None and result.message:
+                self.statusBar().showMessage(result.message, 4000)
+            return []
+        manager = self.sketch_workflow
+        self._push_history(label)
+        deleted = set(result.delete)
+        if deleted:
+            manager.features = [f for f in manager.features if f.feature_id not in deleted]
+            manager.relations = [r for r in manager.relations if not (set(r.entity_ids()) & deleted)]
+        for entity_id, points in result.replace.items():
+            feat = manager.get_feature(entity_id)
+            if feat is not None:
+                feat.points = np.asarray(points, dtype=float)
+        for id_a, id_b in getattr(result, "unlink", []):
+            pair = {id_a, id_b}
+            manager.relations = [
+                r for r in manager.relations
+                if not (r.kind == "coincident" and set(r.entity_ids()) == pair)
+            ]
+        plane = manager.active_plane
+        plane_label = plane.name if plane else self.work_plane.currentText()
+        created = []
+        for entity in result.add:
+            feat = manager.create_feature(
+                entity.kind, plane_label, entity.points, construction=entity.construction,
+                parent_feature_id=None, variant=entity.variant, control_points=entity.control_points,
+            )
+            if entity.construction and entity.kind == "Point":
+                feat.construction = True  # kept reference corners (fillet / chamfer) never get machined
+            created.append(feat)
+
+        def resolve(entity_id: str) -> str:
+            if entity_id.startswith("new:"):
+                return created[int(entity_id[4:])].feature_id
+            return entity_id
+
+        for entity, feat in zip(result.add, created):
+            for dim in entity.dimensions:
+                dim.target_ids = [resolve(t) for t in dim.target_ids] or [feat.feature_id]
+                dim.dim_id = f"{feat.feature_id}_{dim.dim_id}"
+                feat.dimensions.append(dim)
+        for relation in result.relations:
+            relation.refs = [(resolve(e), i) for e, i in relation.refs]
+            manager.relations.append(relation)
+        if getattr(result, "join_ends", False):
+            from basicam.sketch_solver import reference_points
+
+            touched = created + [f for f in (manager.get_feature(i) for i in result.replace) if f is not None]
+            for new in created:
+                if new.construction:
+                    continue
+                for other in touched:
+                    if other is new or other.construction:
+                        continue
+                    for ia, pa in enumerate(reference_points(new)):
+                        for ib, pb in enumerate(reference_points(other)):
+                            if float(np.linalg.norm(np.asarray(pa) - np.asarray(pb))) < 1e-6:
+                                manager.relations.append(Relation("coincident", [(new.feature_id, ia), (other.feature_id, ib)]))
+        if created:
+            self.active_sketch_id = created[-1].feature_id
+        self._refresh_sketch_tree()
+        self._refresh_scene(reset_camera=False)
+        if result.message:
+            self.statusBar().showMessage(result.message, 4000)
+        return created
+
+    def _modify_click(self, press: QPoint, release: QPoint) -> None:
+        from basicam import sketch_tools as tools
+
+        features = self._editable_features()
+        moved = (release - press).manhattanLength() >= self.drag_threshold
+        if self._modify_mode == "trim" and moved:
+            a, b = self._world_at_work_plane(press), self._world_at_work_plane(release)
+            if a is not None and b is not None:
+                self._apply_edit(tools.power_trim(features, [a, b]), "Power trim")
+            return
+        pick = self._sketch_pick_at(release)
+        world = self._world_at_work_plane(release)
+        target = self.sketch_workflow.get_feature(pick.entity_id) if pick is not None else None
+        if target is None or world is None or target not in features:
+            self.statusBar().showMessage("Click a line of the sketch being edited.", 3000)
+            return
+        others = [f for f in features if f is not target]
+        if self._modify_mode == "trim":
+            self._apply_edit(tools.trim(target, world, others), "Trim")
+        elif self._modify_mode == "extend":
+            self._apply_edit(tools.extend(target, world, others), "Extend")
+
+    def _ask_length(self, title: str, prompt: str, default: str = "") -> float | None:
+        text, ok = QInputDialog.getText(self, title, prompt, text=default)
+        if not ok or not text.strip():
+            return None
+        from basicam.sketch_dimensions import parse_dimension_expression
+
+        return parse_dimension_expression(text, 25.4 if self.units.display is LengthUnit.INCHES else 1.0)
+
+    def _run_modify(self, key: str):
+        from basicam import sketch_tools as tools
+
+        manager = self.sketch_workflow
+        selected = [f for f in (manager.get_feature(i) for i in self._selected_entity_ids()) if f is not None and manager.can_edit(f)]
+        if key == "fully_define":
+            features = self._editable_features()
+            if not features:
+                return None
+            relations, dims = tools.fully_define(features, [r for r in manager.relations if set(r.entity_ids()) & {f.feature_id for f in features}])
+            result = tools.EditResult(relations=relations)
+            if not relations and not dims:
+                self.statusBar().showMessage("The sketch is already fully defined.", 3000)
+                return None
+            self._push_history("Fully define sketch")
+            for owner, dim in dims:
+                feat = manager.get_feature(owner)
+                if feat is not None:
+                    feat.dimensions.append(dim)
+            manager.relations.extend(result.relations)
+            self._refresh_sketch_tree()
+            self._refresh_scene(reset_camera=False)
+            return result
+        if key == "convert":
+            part_faces: dict[int, set[int]] = {}
+            for part_index, feature_id in self.selected_features:
+                part_faces.setdefault(part_index, set()).add(feature_id)
+            if not part_faces:
+                self.statusBar().showMessage("Select a model face first, then Convert Entities.", 4000)
+                return None
+            plane = manager.active_plane
+            if plane is None:
+                self.set_work_plane(self.work_plane.currentText())
+                plane = manager.active_plane
+            merged = tools.EditResult()
+            for part_index, feature_ids in part_faces.items():
+                mesh = self.parts[part_index].mesh
+                ids = np.asarray(mesh.cell_data.get("feature_id", np.arange(mesh.n_cells)))
+                cells = np.flatnonzero(np.isin(ids, list(feature_ids)))
+                piece = tools.convert_entities(tools.face_loop_segments(mesh, cells), part_index, plane)
+                offset = len(merged.add)
+                for relation in piece.relations:
+                    relation.refs = [(f"new:{int(e[4:]) + offset}" if e.startswith("new:") else e, i) for e, i in relation.refs]
+                merged.add.extend(piece.add)
+                merged.relations.extend(piece.relations)
+            return self._apply_edit(merged, "Convert entities")
+        if not selected:
+            self.statusBar().showMessage("Select entities of the sketch being edited in the tree first.", 4000)
+            return None
+        if key == "offset":
+            distance = self._ask_length("Offset entities", "Offset distance (negative = other side):", "2")
+            if distance is None or distance == 0:
+                return None
+            return self._apply_edit(tools.offset_entities(selected, abs(distance), 1 if distance > 0 else -1), "Offset entities")
+        if key == "mirror":
+            centre = next((f for f in selected if f.kind == "Construction line"), None)
+            if centre is None:
+                self.statusBar().showMessage("Select a centerline together with the entities to mirror.", 4000)
+                return None
+            return self._apply_edit(tools.mirror([f for f in selected if f is not centre], centre), "Mirror")
+        if key in ("fillet", "chamfer"):
+            lines = [f for f in selected if f.kind == "Line"][:2]
+            if len(lines) < 2:
+                self.statusBar().showMessage("Select two lines that meet at a corner.", 4000)
+                return None
+            value = self._ask_length(key.capitalize(), "Radius:" if key == "fillet" else "Distance:", "2")
+            if value is None or value <= 0:
+                return None
+            fn = tools.fillet if key == "fillet" else tools.chamfer
+            return self._apply_edit(fn(lines[0], lines[1], value), key.capitalize())
+        if key == "move":
+            text, ok = QInputDialog.getText(self, "Move / copy", "Move by dx, dy, dz (add 'copy' to copy):", text="10, 0, 0")
+            if not ok:
+                return None
+            copy = "copy" in text.lower()
+            try:
+                delta = [float(v) for v in text.lower().replace("copy", "").split(",")[:3]]
+            except ValueError:
+                return None
+            delta += [0.0] * (3 - len(delta))
+            return self._apply_edit(tools.move_copy(selected, delta, copy), "Copy entities" if copy else "Move entities")
+        return None
+
+    # ------------------------------------------------------------ Relations panel (v2 Block 5)
+    RELATION_GLYPHS = {
+        "coincident": "C", "horizontal": "H", "vertical": "V", "parallel": "//", "perpendicular": "_|_",
+        "tangent": "T", "equal": "=", "concentric": "Co", "midpoint": "M", "fix": "Fix",
+        "anchor_origin": "O", "anchor_model": "A", "collinear": "Col", "symmetric": "Sym",
+        "on_edge": "E", "on_curve": "On", "equal_radius": "R=",
+    }
+
+    def _build_relations_panel(self) -> QWidget:
+        box = QGroupBox("Relations")
+        layout = QVBoxLayout(box)
+        self.sketch_solve_status = QLabel("")
+        self.sketch_solve_status.setObjectName("mutedText")
+        self.sketch_solve_status.setWordWrap(True)
+        layout.addWidget(self.sketch_solve_status)
+        self.relations_selection_only = QCheckBox("Selected entities only")
+        self.relations_selection_only.toggled.connect(lambda _c: self._refresh_relations_panel())
+        layout.addWidget(self.relations_selection_only)
+        self.relations_list = QTreeWidget()
+        self.relations_list.setHeaderLabels(["Relation", "Entities", "State"])
+        self.relations_list.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.relations_list.setMinimumHeight(110)
+        self.relations_list.itemSelectionChanged.connect(self._on_relation_selected)
+        layout.addWidget(self.relations_list, 1)
+        row = QHBoxLayout()
+        delete_rel = QPushButton("Delete")
+        delete_rel.clicked.connect(self.delete_selected_relations)
+        delete_all = QPushButton("Delete all")
+        delete_all.setToolTip("Delete every relation listed above.")
+        delete_all.clicked.connect(lambda: self.delete_selected_relations(all_listed=True))
+        self.repick_relation_btn = QPushButton("Re-pick")
+        self.repick_relation_btn.setToolTip("Attach a dangling model reference to a new vertex or edge: click it in the view.")
+        self.repick_relation_btn.clicked.connect(self.repick_selected_relation)
+        for button in (delete_rel, delete_all, self.repick_relation_btn):
+            row.addWidget(button)
+        layout.addLayout(row)
+        add_row = QHBoxLayout()
+        self.relation_kind_combo = QComboBox()
+        for kind in RELATION_KINDS:
+            if kind not in ("on_edge", "anchor_model"):
+                self.relation_kind_combo.addItem(kind.replace("_", " ").capitalize(), kind)
+        add_button = QPushButton("Add")
+        add_button.setToolTip("Add this relation between the entities selected in the tree.")
+        add_button.clicked.connect(lambda: self._add_relation(self.relation_kind_combo.currentData()))
+        add_row.addWidget(self.relation_kind_combo, 1)
+        add_row.addWidget(add_button)
+        layout.addLayout(add_row)
+        self._repick_relation_id: str | None = None
+        return box
+
+    def _relation_state(self, relation, results: dict) -> str:
+        if getattr(relation, "dangling", False):
+            return "Dangling"
+        owner = None
+        for entity_id in relation.entity_ids():
+            feat = self.sketch_workflow.get_feature(entity_id)
+            if feat is not None:
+                owner = feat.owner_sketch_id or "_"
+                break
+        result = results.get(owner) if owner is not None else None
+        if result is None:
+            return "Not solved"
+        if relation.rel_id in result.conflicting_ids:
+            return "Conflicting"
+        if result.state == "error":
+            return "Not solved"
+        return "Satisfied"
+
+    def _refresh_relations_panel(self) -> None:
+        if not hasattr(self, "relations_list"):
+            return
+        results = getattr(self, "_last_solve_results", {}) or {}
+        manager = self.sketch_workflow
+        selected = set(self._selected_entity_ids()) if self.relations_selection_only.isChecked() else None
+        self.relations_list.blockSignals(True)
+        self.relations_list.clear()
+        for relation in manager.relations:
+            ids = relation.entity_ids()
+            if selected is not None and not (set(ids) & selected):
+                continue
+            names = []
+            for entity_id in ids:
+                feat = manager.get_feature(entity_id)
+                names.append(feat.name.split("·")[-1].strip() if feat is not None else f"{entity_id} (deleted)")
+            state = self._relation_state(relation, results)
+            item = QTreeWidgetItem([relation.kind.replace("_", " "), ", ".join(names), state])
+            item.setData(0, Qt.ItemDataRole.UserRole, relation.rel_id)
+            if state in ("Conflicting",):
+                item.setForeground(2, QColor(theme_color("error")))
+            elif state in ("Dangling", "Not solved"):
+                item.setForeground(2, QColor(theme_color("warning")))
+            self.relations_list.addTopLevelItem(item)
+        self.relations_list.blockSignals(False)
+        active = manager.active_owner or next(iter(results), None)
+        if active is not None and hasattr(self, "sketch_solve_status"):
+            name = manager.sketches.get(active, {}).get("name", "Sketch")
+            self.sketch_solve_status.setText(sketch_status_text(name, results.get(active)))
+
+    def _selected_relation_ids(self) -> list[str]:
+        return [item.data(0, Qt.ItemDataRole.UserRole) for item in self.relations_list.selectedItems()]
+
+    def _on_relation_selected(self) -> None:
+        ids = set()
+        for rel_id in self._selected_relation_ids():
+            relation = next((r for r in self.sketch_workflow.relations if r.rel_id == rel_id), None)
+            if relation is not None:
+                ids.update(relation.entity_ids())
+        self.highlight_feature_ids = {("sketch", entity_id, -1) for entity_id in ids}
+        self._refresh_scene(reset_camera=False)
+
+    def delete_selected_relations(self, all_listed: bool = False) -> int:
+        if all_listed:
+            ids = [self.relations_list.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole) for i in range(self.relations_list.topLevelItemCount())]
+        else:
+            ids = self._selected_relation_ids()
+        if not ids:
+            return 0
+        self._push_history("Delete relations")
+        before = len(self.sketch_workflow.relations)
+        self.sketch_workflow.relations = [r for r in self.sketch_workflow.relations if r.rel_id not in set(ids)]
+        self.highlight_feature_ids = set()
+        self._refresh_sketch_tree()
+        self._refresh_scene(reset_camera=False)
+        return before - len(self.sketch_workflow.relations)
+
+    def repick_selected_relation(self) -> None:
+        ids = self._selected_relation_ids()
+        relation = next((r for r in self.sketch_workflow.relations if r.rel_id in ids and r.kind in ("anchor_model", "on_edge")), None)
+        if relation is None:
+            self.statusBar().showMessage("Select a model reference (anchor or on edge) in the Relations list.", 4000)
+            return
+        self._repick_relation_id = relation.rel_id
+        self.statusBar().showMessage("Click a model vertex (anchor) or edge (on edge) in the view.", 6000)
+
+    def _finish_repick(self, snap) -> bool:
+        """Attach the relation being re-picked to the clicked model vertex / edge."""
+        relation = next((r for r in self.sketch_workflow.relations if r.rel_id == self._repick_relation_id), None)
+        self._repick_relation_id = None
+        if relation is None or snap is None or snap.kind not in ("ModelVertex", "ModelEdge"):
+            self.statusBar().showMessage("No model vertex or edge there; re-pick cancelled.", 4000)
+            return False
+        self._push_history("Re-pick model reference")
+        if snap.kind == "ModelVertex":
+            relation.kind, relation.value = "anchor_model", [float(c) for c in snap.point]
+        else:
+            relation.kind, relation.value = "on_edge", np.asarray(snap.segment, dtype=float).reshape(-1).tolist()
+        relation.part_index, relation.dangling = snap.part_index, False
+        self._refresh_sketch_tree()
+        self._refresh_scene(reset_camera=False)
+        self.statusBar().showMessage("Model reference re-attached.", 3000)
+        return True
+
+    def _relation_glyphs(self) -> tuple[np.ndarray, list[str]]:
+        """Glyph positions and labels: one per relation, at its entity's midpoint (spec B6)."""
+        from basicam.sketch_solver import reference_points
+
+        manager = self.sketch_workflow
+        positions, labels, stacked = [], [], {}
+        for relation in manager.relations:
+            if not relation.refs:
+                continue
+            entity_id, index = relation.refs[0]
+            feat = manager.get_feature(entity_id)
+            if feat is None or len(feat.points) == 0:
+                continue
+            if index is not None:
+                refs = reference_points(feat)
+                anchor = np.asarray(refs[min(index, len(refs) - 1)], dtype=float)
+            else:
+                pts = np.asarray(feat.points, dtype=float)
+                anchor = pts[len(pts) // 2] if feat.kind not in ("Line", "Construction line") else pts.mean(axis=0)
+            key = tuple(np.round(anchor, 6))
+            count = stacked.get(key, 0)
+            stacked[key] = count + 1
+            positions.append(anchor)
+            labels.append(("  " * count) + self.RELATION_GLYPHS.get(relation.kind, relation.kind[:2]))
+        return (np.asarray(positions, dtype=float).reshape(-1, 3), labels)
+
+    def _drag_sketch_point(self, feat_id: str, display_index: int, new_point) -> bool:
+        """Drag to explore: re-solve with the dragged point held at the cursor (spec B8)."""
+        from basicam.sketch_solver import SketchSolver, plane_for, reference_points
+
+        manager = self.sketch_workflow
+        feat = manager.get_feature(feat_id)
+        if feat is None:
+            return False
+        group = [f for f in manager.features if (f.owner_sketch_id or "_") == (feat.owner_sketch_id or "_")]
+        ids = {f.feature_id for f in group}
+        relations = [r for r in manager.relations if set(r.entity_ids()) & ids]
+        refs = reference_points(feat)
+        handle = np.asarray(feat.points[min(display_index, len(feat.points) - 1)], dtype=float)
+        ref_index = int(np.argmin([float(np.linalg.norm(np.asarray(r) - handle)) for r in refs])) if refs else 0
+        solver = SketchSolver()
+        before = solver.solve(group, relations, apply=False)
+        if before.state == "defined" and before.dof == 0:
+            self.statusBar().showMessage(
+                f"{feat.name} is fully defined: its dimensions and relations hold it in place.", 3000
+            )
+            return False
+        plane = plane_for(group)
+        result = solver.solve(group, relations, dragged=(feat_id, ref_index, plane.world_to_uv(np.asarray(new_point, dtype=float))))
+        if result.state == "error":
+            self.statusBar().showMessage(result.message or "Could not move there.", 3000)
+            return False
+        return True
 
     # ------------------------------------------------------------ Position tab (Block 8)
     def _build_position_tab(self) -> QWidget:
@@ -4270,6 +6015,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.sketch_variant.addItems(list(variants))
         self.finish_spline_btn.setVisible(kind == "Spline")
         self.pending_sketch_points.clear()
+        self.sketch_chain.reset()
+        self._click_snaps.clear()
 
     def _update_sketch_tab_state(self, editing: bool) -> None:
         """Tools are only live while a sketch is being edited on a plane or face."""
@@ -4348,7 +6095,21 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             )
             return
         self._push_history("Edit sketch dimension")
+        plan = None
         if len(entity_ids) == 2:
+            from basicam.sketch_dimensions import Pick, infer_dimension, refine_plan
+
+            feats = [self.sketch_workflow.get_feature(i) for i in entity_ids]
+            if all(f is not None for f in feats):
+                plan = infer_dimension([Pick(f.feature_id, f.kind) for f in feats])
+                plan = refine_plan(plan, self._features_by_id()) if plan is not None else None
+        if plan is not None and plan.kind in ("Angle", "PointLine"):
+            # Same inference as Smart Dimension: two lines -> angle (parallel: distance), point + line.
+            value = float(text) if plan.kind == "Angle" and _is_plain_number(text) else millimeters
+            self._dim_plan = plan
+            self._pending_dimension = {"plan": plan, "offset": [0.0, 0.0], "measured": None}
+            ok = self._commit_dimension(str(value) if plan.kind == "Angle" else f"{millimeters}mm") is not None
+        elif len(entity_ids) == 2:
             ok = self.sketch_workflow.set_pair_distance(entity_ids[0], entity_ids[1], millimeters, unit_text, sig_figs) is not None
         elif payloads[0][0] == "dim":
             _kind, feature_id, dim_id = payloads[0]
@@ -4376,13 +6137,35 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
 
     # --- Esc: back out one layer per press ------------------------------------------------
     def escape_layered(self) -> None:
+        if getattr(self, "_dim_picks", None) or getattr(self, "_pending_dimension", None):
+            self._cancel_dimension()
+            self.statusBar().showMessage("Dimension cancelled.", 2000)
+            return
+        if self._dimension_tool_active():
+            self.smart_dimension_btn.setChecked(False)
+            return
+        if getattr(self, "_modify_mode", None):
+            self._set_modify_mode(None)
+            return
         if self.sketch_workflow.has_errors() and self._revert_sketch_errors():
             self.statusBar().showMessage("Sketch error reverted.", 3000)
             return
-        if self.pending_sketch_points:
+        if self.pending_sketch_points or self.sketch_chain.active:
             self.pending_sketch_points.clear()
+            self.sketch_chain.reset()
+            self._click_snaps.clear()
+            self._typed_value = ""
+            self._hide_sketch_readout()
             self._refresh_scene(reset_camera=False)
             self.statusBar().showMessage("Cancelled the sketch entity in progress.", 2500)
+            return
+        if self._sketch_tool_active():
+            group = self.sketch_tool_group
+            group.setExclusive(False)
+            group.checkedButton().setChecked(False)
+            group.setExclusive(True)
+            self._hide_sketch_readout()
+            self.statusBar().showMessage("Left the drawing tool.", 2000)
             return
         if self.dimension_input.text():
             self.dimension_input.clear()
@@ -4608,8 +6391,32 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         layout.setSpacing(11)
         layout.addWidget(self._section_label("NEW OPERATION"))
         self.operation_kind = QComboBox()
-        self.operation_kind.addItems(["Rough", "Finish", "Drill", "Ream", "Tap"])
+        self.operation_kind.addItems(["Rough", "Finish", "Pocket", "Profile", "Trace", "Drill", "Ream", "Tap", "Cut", "Engrave",
+                                      "Face", "Rough turn", "Finish turn", "Groove", "Part off", "Centre drill", "Thread"])
         layout.addWidget(self.operation_kind)
+        side_row = QHBoxLayout()
+        self.profile_side_label = QLabel("Profile side")
+        self.profile_side = QComboBox()
+        self.profile_side.addItems(["Outside", "Inside", "On"])
+        self.profile_side.setToolTip("Outside or Inside: the tool runs beside the line by its radius; On: centred on it.")
+        side_row.addWidget(self.profile_side_label)
+        side_row.addWidget(self.profile_side, 1)
+        layout.addLayout(side_row)
+        self.peck_depth = QDoubleSpinBox()
+        self.peck_depth.setRange(0.0, 100.0)
+        self.peck_depth.setDecimals(3)
+        self.peck_depth.setSuffix(" mm")
+        self.peck_depth.setToolTip("Drill: depth of each peck before retracting to clear chips (0 = one plunge).")
+        self.peck_depth_label = QLabel("Peck depth")
+        peck_row = QHBoxLayout()
+        peck_row.addWidget(self.peck_depth_label)
+        peck_row.addWidget(self.peck_depth, 1)
+        layout.addLayout(peck_row)
+        self.wrap_rotary = QCheckBox("Wrap on the rotary axis")
+        self.wrap_rotary.setToolTip("Draw the sketch unwrapped (Y = distance around the stock); it is wrapped onto the round stock.")
+        layout.addWidget(self.wrap_rotary)
+        self.operation_kind.currentTextChanged.connect(self._update_contour_fields)
+        self._update_contour_fields(self.operation_kind.currentText())
         self.target_label = QLabel("Target: Whole part")
         self.target_label.setObjectName("mutedText")
         self.target_label.setWordWrap(True)
@@ -4721,9 +6528,9 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         entry_defaults.clicked.connect(self._apply_entry_defaults)
         entry_form.addRow(entry_defaults)
         layout.addWidget(entry_box)
-        trace_btn = QPushButton("Trace curved face...")
-        trace_btn.setToolTip("3-axis surface roughing then finishing on the selected face(s); never cuts into the surface.")
-        trace_btn.clicked.connect(self.trace_curved_face)
+        trace_btn = QPushButton("Assign tool...")
+        trace_btn.setToolTip("Pick a tool for the selected face or surface: a toolpath sketch is generated outside the surface (rough, then 3-axis finish).")
+        trace_btn.clicked.connect(lambda: self.assign_tool_to_surface())
         layout.addWidget(trace_btn)
 
         add_operation = QPushButton("Add operation to stack")
@@ -4791,14 +6598,21 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         return panel
 
     def open_part(self) -> None:
-        path = self._choose_part_path("Open part in new workspace")
-        if path:
-            self._load_part_path(path, replace_workspace=True)
+        paths = self._choose_part_paths("Open part(s) in new workspace")
+        if paths:
+            self._load_part_paths(paths, replace_workspace=True)
 
     def import_part(self) -> None:
-        path = self._choose_part_path("Import part into current workspace")
-        if path:
-            self._load_part_path(path, replace_workspace=False)
+        paths = self._choose_part_paths("Import part(s) into current workspace")
+        if paths:
+            self._load_part_paths(paths, replace_workspace=False)
+
+    def _choose_part_paths(self, title: str) -> list[str]:
+        extensions = " ".join(f"*{suffix}" for suffix in sorted(SUPPORTED_SUFFIXES))
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, title, "", f"Supported now ({extensions});;All files (*.*)"
+        )
+        return list(paths)
 
     def _choose_part_path(self, title: str) -> str:
         extensions = " ".join(f"*{suffix}" for suffix in sorted(SUPPORTED_SUFFIXES))
@@ -4811,27 +6625,69 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         return path
 
     def _load_part_path(self, path: str, replace_workspace: bool) -> None:
-        default_name = Path(path).stem
+        self._load_part_paths([path], replace_workspace)
+
+    def _part_gap_mm(self) -> float:
+        try:
+            return max(0.0, float(self.settings.value("import/part_gap_mm", 10.0)))
+        except (TypeError, ValueError):
+            return 10.0
+
+    def _place_new_geometry(self, geometry, part_name: str):
+        """First part: bounding-box corner at 0,0,0. Later parts: beside the existing parts (+X)."""
+        others = [
+            p for p in self.parts
+            if p.role is not PartRole.STOCK and p.mesh is not None and p.mesh.n_points > 0
+        ]
+        if not others:
+            placed = place_at_origin(geometry)
+            where = "with its bounding-box corner at 0,0,0"
+        else:
+            corner = geometry_min_corner(geometry)
+            max_x = max(float(p.mesh.bounds[1]) for p in others)
+            placed = offset_geometry(
+                geometry, (max_x + self._part_gap_mm() - corner[0], -corner[1], -corner[2])
+            )
+            where = "beside the existing parts"
+        if any(abs(value) > 1e-9 for value in placed.placement_offset):
+            unit = self.units.display.value
+            moved = ", ".join(format_length(value, unit) for value in placed.placement_offset)
+            self.terminal_core.log("info", f"Placed {part_name} {where} (moved {moved}).")
+        return placed
+
+    def _load_part_paths(self, paths: list[str], replace_workspace: bool) -> list:
+        """Import one or more parts. Several parts: ask about material and thickness afterwards."""
+        paths = [str(p) for p in paths if p]
+        if not paths:
+            return []
+        default_name = Path(paths[0]).stem if len(paths) == 1 else f"{len(paths)} parts"
         meta = self._prompt_import_metadata(default_name, replace_workspace)
         if meta is None:
-            return
-        job_name, part_name, material_name = meta
+            return []
+        job_name, part_name, material_name, keep_file_coordinates = meta
         self.project_name_label.setText(job_name)
         if self.stock_material.findText(material_name) >= 0:
             self.stock_material.setCurrentText(material_name)
         unit_factor = 25.4 if self.units.imported_as is LengthUnit.INCHES else 1.0
-        try:
-            geometry = load_part_geometry(path, unit_factor)
-        except Exception as error:
-            self._critical_box(self, "Import failed", str(error))
-            return
+        loaded = []
+        for path in paths:
+            try:
+                loaded.append((path, load_part_geometry(path, unit_factor)))
+            except Exception as error:
+                self._critical_box(self, "Import failed", f"{Path(path).name}: {error}")
+        if not loaded:
+            return []
         self._push_history(f"Import {part_name}")
         if replace_workspace:
             self._reset_workspace()
-        role = PartRole.TARGET
-        self.parts.append(
-            PartModel(
-                part_name,
+        new_parts = []
+        unsupported: list[str] = []
+        for path, geometry in loaded:
+            name = part_name if len(loaded) == 1 else Path(path).stem
+            if not keep_file_coordinates:
+                geometry = self._place_new_geometry(geometry, name)
+            part = PartModel(
+                name,
                 geometry.mesh,
                 Path(path),
                 imported=True,
@@ -4840,28 +6696,67 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 edge_mesh=geometry.edge_mesh,
                 solid_conversion_message=geometry.solid_conversion_message,
                 native_brep=geometry.native_brep,
-                role=role,
+                role=PartRole.TARGET,
             )
-        )
-        if role is PartRole.STOCK:
-            self.stock_part = self.parts[-1]
-            self.stock_mesh = geometry.mesh
-            self.stock_imported = True
-            self.stock_status.setText(f"Stock · {part_name}")
-        else:
-            self._check_bed_fit(self.parts[-1])
+            part.material = material_name
+            self.parts.append(part)
+            new_parts.append(part)
+            unsupported.extend(getattr(geometry, "unsupported", None) or [])
+        if len(new_parts) > 1:
+            self._ask_part_materials(new_parts, material_name)
+        for part in new_parts:
+            self._check_bed_fit(part)
         self._refresh_parts()
         self.parts_list.setCurrentRow(len(self.parts) - 1)
         self._refresh_note_targets()
         self._refresh_scene()
-        status = f"Imported {Path(path).name} as {geometry.geometry_type.lower()}"
-        if geometry.solid_conversion_message:
-            status += f" · {geometry.solid_conversion_message}"
+        if len(loaded) == 1:
+            geometry = loaded[0][1]
+            status = f"Imported {Path(loaded[0][0]).name} as {geometry.geometry_type.lower()}"
+            if geometry.solid_conversion_message:
+                status += f" · {geometry.solid_conversion_message}"
+        else:
+            status = f"Imported {len(loaded)} parts"
         self.statusBar().showMessage(status, 8000)
-        if getattr(geometry, "unsupported", None):
-            message = "Not imported (unsupported entities): " + ", ".join(geometry.unsupported)
+        if unsupported:
+            message = "Not imported (unsupported entities): " + ", ".join(sorted(set(unsupported)))
             self.terminal_core.log("warning", message)
             QMessageBox.information(self, "Some entities were not imported", message)
+        if len(new_parts) > 1:
+            self._offer_nesting(new_parts)
+        return new_parts
+
+    def _ask_part_materials(self, parts: list, default_material: str) -> None:
+        names = [p.name for p in parts]
+        materials = self.material_store.names()
+        shared = SharedMaterialDialog(names, materials, default_material, self)
+        if shared.exec() != QDialog.DialogCode.Accepted:
+            return
+        if shared.same:
+            for part in parts:
+                part.material = shared.material.currentText()
+                part.thickness_mm = float(shared.thickness.value())
+            return
+        table = PartMaterialsDialog(names, materials, default_material, self)
+        if table.exec() != QDialog.DialogCode.Accepted:
+            return
+        for part, values in zip(parts, table.values()):
+            part.material = values["material"]
+            part.thickness_mm = values["thickness_mm"]
+            part.quantity = values["quantity"]
+            part.allow_rotation = values["allow_rotation"]
+
+    def _offer_nesting(self, parts: list) -> None:
+        """Offer "Nest on stock now" once nesting exists (roadmap Block 16)."""
+        nest = getattr(self, "nest_parts", None)
+        if nest is None:
+            return
+        reply = QMessageBox.question(
+            self, "Nest parts", "Nest the opened parts on the stock now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.nest_parts_with_dialog(parts)
 
     def export_part(self) -> None:
         """Export the selected part, or every part, as STL or STEP; anything not exported is listed."""
@@ -5008,9 +6903,70 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.stock_status.setText(
             f"{len(groups)} stock box(es) · {material}".rstrip(" ·")
         )
+        self.stock_spec = None
+        self._refresh_stock_kind_label()
         self._refresh_parts()
         self._refresh_note_targets()
         self._refresh_scene()
+
+    def _refresh_stock_kind_label(self) -> None:
+        spec = getattr(self, "stock_spec", None)
+        if spec is None:
+            self.stock_kind_label.setText("Stock type: block (from part bounds)")
+            return
+        unit = self.units.display.value
+        sx, sy, sz = spec.size()
+        if spec.kind in ("bar", "tube"):
+            text = f"Stock type: {spec.kind} · Ø{format_length(spec.diameter, unit)} × {format_length(spec.length, unit)}"
+            if spec.kind == "bar":
+                text += f" · {spec.bar_shape}"
+            else:
+                text += f" · wall {format_length(spec.wall, unit)}"
+        else:
+            text = (
+                f"Stock type: {spec.kind} · {format_length(sx, unit)} × {format_length(sy, unit)}"
+                f" × {format_length(sz, unit)}"
+            )
+        self.stock_kind_label.setText(text + f" · {spec.material}")
+
+    def _sheet_top_at_z0(self) -> bool:
+        return bool(self.settings.value("stock/sheet_top_at_z0", False, type=bool))
+
+    def define_stock(self) -> None:
+        """Stock dialog: block, sheet / plate, bar or tube."""
+        spec = self.stock_spec
+        if spec is None:
+            dims = self._stock_dims_mm()
+            spec = StockSpec(
+                kind="block", length=dims["X"], width=dims["Y"], thickness=dims["Z"],
+                material=self.stock_material.currentText(),
+            )
+        dialog = StockDialog(spec, self.material_store.names(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.apply_stock_spec(dialog.spec())
+
+    def apply_stock_spec(self, spec: StockSpec) -> None:
+        spec.top_at_z0 = self._sheet_top_at_z0()
+        mesh = build_stock_mesh(spec)
+        self._set_stock_geometry(f"Stock · {spec.kind}", mesh, None, imported=False)
+        self.stock_spec = spec
+        for axis, value in zip("XYZ", spec.size()):
+            self.stock_dimensions[axis].setValue(float(value))
+        if self.stock_material.findText(spec.material) >= 0:
+            self.stock_material.setCurrentText(spec.material)
+        self.stock_status.setText(f"Stock · {spec.kind}")
+        self._refresh_stock_kind_label()
+        if spec.is_flat and self.current_machine is not None:
+            sx, sy, _sz = spec.size()
+            axes = [a for a in fit_report((sx, sy, 0.0), self.current_machine) if a in ("X", "Y")]
+            if axes:
+                message = (
+                    f"The {spec.kind} is larger than the work area of {self.current_machine.name} in "
+                    f"{', '.join(axes)}. Only the part inside the work area can be cut; reposition the "
+                    f"{spec.kind} for the rest."
+                )
+                self.terminal_core.log("warning", message)
+                self.statusBar().showMessage(message, 8000)
 
     def _set_stock_geometry(
         self,
@@ -5127,6 +7083,14 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if not 0 <= index < len(self.parts):
             return
         removed = self.parts.pop(index)
+        dangling = mark_part_deleted(self.sketch_workflow.relations, index)
+        if dangling:
+            self.terminal_core.log(
+                "warning",
+                f"{dangling} sketch reference(s) to {removed.name} are now dangling; "
+                "re-pick a vertex or edge in the Relations panel, or undo.",
+            )
+            self._solve_sketches()
         if removed is self.stock_part:
             self.stock_part = None
             self.stock_mesh = None
@@ -5323,9 +7287,12 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 feat.points = apply_to_points(m, feat.points)
                 if feat.projected_points is not None:
                     feat.projected_points = apply_to_points(m, feat.projected_points)
+        model_reference_shift(manager.relations, index, lambda point: apply_to_point(m, point))
         if old_mesh is not None and old_mesh.n_points:
             verts = np.asarray(old_mesh.points)
             for rel in manager.relations:
+                if rel.part_index is not None:
+                    continue  # moved above by part index
                 if rel.value and rel.kind in ("anchor_model", "fix"):
                     if float(np.min(np.linalg.norm(verts - np.asarray(rel.value), axis=1))) < 1e-6:
                         rel.value = apply_to_point(m, rel.value).tolist()
@@ -5950,6 +7917,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                         self._add_hidden_edges(edge_source, part_index)
 
         self._draw_sketch_entities()
+        self._draw_rotary_device()
+        self._draw_turning_side_view()
         self._draw_schematic_path()
         self._draw_ghost_tool()
         self._apply_lighting(render=False)
@@ -5958,7 +7927,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.plotter.reset_camera()
         self.plotter.render()
         
-    def _prompt_import_metadata(self, default_part_name: str, replace_workspace: bool) -> tuple[str, str, str] | None:
+    def _prompt_import_metadata(self, default_part_name: str, replace_workspace: bool) -> tuple[str, str, str, bool] | None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Part & Job Setup")
         form = QFormLayout(dialog)
@@ -5992,6 +7961,16 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         material_combo.setToolTip("Stock material used for cutting parameter recommendations")
         form.addRow("Material", material_combo)
 
+        keep_coordinates = QCheckBox("Keep file coordinates")
+        keep_coordinates.setChecked(
+            bool(self.settings.value("import/keep_file_coordinates", False, type=bool))
+        )
+        keep_coordinates.setToolTip(
+            "Off: the part's bounding-box corner is placed at 0,0,0. "
+            "On: the part keeps the coordinates stored in the file."
+        )
+        form.addRow("", keep_coordinates)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -6002,9 +7981,10 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
 
+        self.settings.setValue("import/keep_file_coordinates", keep_coordinates.isChecked())
         job_name = job_input.text().strip() or ("Untitled job" if replace_workspace else self.project_name_label.text())
         part_name = part_input.text().strip() or default_part_name
-        return job_name, part_name, material_combo.currentText()
+        return job_name, part_name, material_combo.currentText(), keep_coordinates.isChecked()
 
     def _draw_schematic_path(self) -> None:
         if not self._has_any_operations() or not self.parts:
@@ -6056,7 +8036,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         target_feat = next((f for f in self.sketch_workflow.features if f.name == self.operation_target), None)
         if target_feat is not None:
             self._solve_sketches()
-            allowed, reason = can_assign_tool(target_feat)
+            allowed, reason = can_assign_tool(target_feat, self._sketch_problems_for(target_feat))
             if not allowed:  # tools only on fully defined sketch entities
                 self.terminal_core.log("warning", f"Operation not added: {reason}")
                 QMessageBox.warning(self, "Cannot assign a tool", reason)
@@ -6078,6 +8058,11 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         )
         operation.overlap_pct = float(self.overlap.value())
         operation.finish_quality = self.finish_quality.currentText()
+        operation.profile_side = self.profile_side.currentText()
+        operation.peck_mm = float(self.peck_depth.value())
+        operation.aux = self._default_aux()
+        operation.wrap = bool(self.wrap_rotary.isChecked())
+        operation.stepover_ratio = max(0.05, 1.0 - float(self.overlap.value()) / 100.0)
         self._read_entry_fields(operation)
         self.active_setup.operations.append(operation)
         if target_feat is not None:
@@ -6111,45 +8096,103 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 widget.setValue(values[field_name])
 
     def trace_curved_face(self) -> None:
-        """Create surface roughing + finishing operations for the selected face(s)."""
+        """Older name of Assign tool on a surface (kept for the keybinds and scripts)."""
+        self.assign_tool_to_surface()
+
+    def assign_tool_to_surface(self, tool=None, params=None):
+        """Assign tool on a face / manifold surface (v2 Block 9): pick a tool from the inventory,
+        then a fully defined toolpath sketch (rough layers + 3-axis finish) is generated outside
+        the surface and Surface rough / Surface finish operations run from it."""
+        from basicam.toolpath_sketch import generate_toolpath_sketch
+
         if not self.selected_features:
-            QMessageBox.information(self, "Trace curved face", "Select the face(s) to trace in the viewer first.")
-            return
+            QMessageBox.information(self, "Assign tool", "Select the face(s) or surface in the viewer first.")
+            return None
         part_index = sorted(self.selected_features)[0][0]
         feature_ids = sorted(f for p, f in self.selected_features if p == part_index)
-        params = trace_surface_dialog(self, self.tools, self._tool_diameter_mm())
+        if tool is None:
+            picker = ToolLibraryDialog(self.tools, self, picker=True)
+            if picker.exec() != QDialog.DialogCode.Accepted or picker.selected_tool() is None:
+                return None
+            tool = picker.selected_tool()
         if params is None:
-            return
+            params = trace_surface_dialog(self, self.tools, float(tool.diameter_mm), fixed_tool=tool.name)
+            if params is None:
+                return None
         surface = self._surface_mesh_for(part_index, feature_ids)
         if surface is None:
-            return
-        finer, deviation = suggest_finer_tool(surface, params, [t.diameter_mm for t in self.tools])
-        if finer is not None:
-            self.terminal_core.log(
-                "warning", f"A {params.tool_diameter_mm:g} mm tool leaves up to {deviation:.2f} mm in the detail; "
-                f"a {finer:g} mm tool can reach it. Add a finishing operation with the smaller tool."
-            )
-            QMessageBox.information(
-                self, "Finer tool suggested",
-                f"The {params.tool_diameter_mm:g} mm tool cannot reach all the detail (up to {deviation:.2f} mm left). "
-                f"Consider a {finer:g} mm tool for finishing.",
-            )
-        self._push_history("Trace curved face")
+            return None
         target = f"{self.parts[part_index].name} · Surface"
-        kinds = (["Surface rough"] if params.remove_bulk else []) + ["Surface finish"]
+        existing = [op for op in self.operations if (getattr(op, "surface", None) or {}).get("toolpath_sketch") and op.target == target
+                    and (op.surface.get("features") == feature_ids)]
+        if existing:
+            reply = QMessageBox.question(
+                self, "Replace toolpath", "This surface already has a toolpath sketch. Replace it with one for the new tool?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return None
+        stock_top = float(self.stock_mesh.bounds[5]) if self.stock_mesh is not None and self.stock_mesh.n_points else None
+        plan = generate_toolpath_sketch(surface, tool, params, stock_top_z=stock_top, inch=self.units.display is LengthUnit.INCHES)
+        if not plan.passes:
+            QMessageBox.information(self, "Assign tool", "No toolpath fits this surface with that tool.")
+            return None
+        self._push_history("Assign tool to surface")
+        manager = self.sketch_workflow
+        for op in existing:
+            old_sketch = op.surface.get("toolpath_sketch")
+            manager.features = [f for f in manager.features if f.owner_sketch_id != old_sketch]
+            for setup in self.setups:
+                setup.operations = [o for o in setup.operations if o is not op]
+        previous_owner = manager.active_owner
+        sketch_id = manager.begin_sketch("XY plane")
+        manager.sketches[sketch_id]["name"] = f"Toolpath · {tool.name}"
+        manager.sketches[sketch_id]["part_index"] = part_index
+        manager.sketches[sketch_id]["toolpath"] = True
+        vertices = np.asarray(self.parts[part_index].mesh.points, dtype=float)
+        for index, path in enumerate(plan.passes, start=1):
+            feat = manager.create_feature("Toolpath", "XY plane", path.points, parent_feature_id=None, variant=f"Toolpath {path.kind}")
+            feat.name = f"Toolpath {index:03d} · {path.kind}" + (f" · layer {path.layer}" if path.layer else "")
+            first = np.asarray(path.points[0], dtype=float)
+            near = int(np.argmin(np.linalg.norm(vertices - first, axis=1))) if len(vertices) else -1
+            if near >= 0 and float(np.linalg.norm(vertices[near] - first)) <= plan.rounding_mm:
+                manager.relations.append(Relation("anchor_model", [(feat.feature_id, 0)], vertices[near].tolist(), part_index=part_index))
+            else:  # defined by X/Y/Z from the origin
+                for axis in "XYZ":
+                    value = float(first["XYZ".index(axis)])
+                    feat.dimensions.append(SketchDimension(f"{feat.feature_id}_{axis}", axis, axis, value, target_ids=[feat.feature_id]))
+        manager.active_owner = previous_owner
+        kinds = (["Surface rough"] if "rough" in plan.kinds() else []) + ["Surface finish"]
         for kind in kinds:
             op = Operation(
-                name=f"{len(self.operations) + 1:02d} · {kind}", kind=kind, tool=self.tool_name.currentText(),
+                name=f"{len(self.operations) + 1:02d} · {kind}", kind=kind, tool=tool.name,
                 rpm=self.spindle.value(), feed_mm_min=self.feed.value(), stepdown_mm=params.stepdown_mm,
                 depth_mm=max(params.stepdown_mm, 0.1), direction=self.direction.currentText().casefold(),
-                tool_diameter_mm=params.tool_diameter_mm, target=target,
+                tool_diameter_mm=float(tool.diameter_mm), target=target,
             )
-            op.surface = {"part": part_index, "features": feature_ids, "params": params.to_dict(), "finish": kind == "Surface finish"}
+            op.surface = {
+                "part": part_index, "features": feature_ids, "params": params.to_dict(),
+                "finish": kind == "Surface finish", "toolpath_sketch": sketch_id,
+            }
             self.active_setup.operations.append(op)
         self.generate_action.setEnabled(True)
         self.export_button.setEnabled(True)
+        self._refresh_sketch_tree()
         self._refresh_operation_stack()
         self._refresh_scene(reset_camera=False)
+        self.statusBar().showMessage(
+            f"Toolpath sketch: {len(plan.passes)} passes, stepover {plan.stepover_mm:.3f} mm, "
+            f"rapids {plan.ordered_rapid_mm:.1f} mm.", 6000,
+        )
+        return sketch_id
+
+    def _toolpath_sketch_passes(self, sketch_id: str, finish: bool) -> list:
+        wanted = "Toolpath finish" if finish else "Toolpath rough"
+        return [
+            [tuple(map(float, p)) for p in np.asarray(f.points, dtype=float)]
+            for f in self.sketch_workflow.features
+            if f.owner_sketch_id == sketch_id and f.variant == wanted and len(f.points) >= 2
+        ]
 
     def _surface_mesh_for(self, part_index: int, feature_ids) -> pv.PolyData | None:
         if not 0 <= part_index < len(self.parts):
@@ -6389,10 +8432,34 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         return [(float(x), float(y)) for x, y, _z in pts]
 
     def _operation_segments(self, op, setup, settings) -> list:
+        if str(op.kind) in self.LATHE_KINDS:
+            return self._turning_segments(op)
+        if str(op.kind) == "Cut":
+            return self._cut_operation_segments(op)
+        if str(op.kind) in ("Engrave", "Etch") and getattr(setup, "work_type", "") == "surface":
+            from basicam.job_type import follow_surface
+
+            height_at = self._surface_height_function(setup)
+            flat = self._operation_segments_plain(op, setup, settings)
+            if height_at is None:
+                return flat
+            machine = getattr(self, "current_machine", None)
+            laser = machine is not None and machine.process in ("laser", "rotary_laser", "laser_lathe")
+            params = self._process_params_for(op) if laser else None
+            offset = float(params.focus_offset_mm) if params is not None else -abs(float(op.depth_mm))
+            return follow_surface(flat, height_at, offset)
+        segments = self._rotary_operation_segments(op, setup, self._operation_segments_plain(op, setup, settings))
+        if getattr(setup, "tool_orientation", None):
+            segments = self._positional_segments(setup, segments)
+        return segments
+
+    def _operation_segments_plain(self, op, setup, settings) -> list:
         bounds_xy = (float(settings.x_min_mm), float(settings.x_max_mm), float(settings.y_min_mm), float(settings.y_max_mm))
         surface = getattr(op, "surface", None)
         passes = None
-        if surface:
+        if surface and surface.get("toolpath_sketch"):
+            passes = self._toolpath_sketch_passes(surface["toolpath_sketch"], bool(surface.get("finish", True))) or None
+        elif surface:
             mesh = self._surface_mesh_for(int(surface.get("part", 0)), surface.get("features", []))
             if mesh is not None:
                 params = SurfaceParams.from_dict(surface.get("params"))
@@ -6400,10 +8467,69 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 params.remove_bulk = not finish
                 plan = plan_surface(mesh, params, stock_top_z=float(settings.stock_top_z_mm), finish=finish)
                 passes = plan.passes or None
+        contour_paths, drill_points = (None, None) if passes else self._operation_contour_inputs(op)
         return self.toolpath_dynamics.build_operation_segments(
             op, setup=setup, stock_top_z_mm=float(settings.stock_top_z_mm), bounds_xy=bounds_xy,
             path_xy=self._operation_path_xy(op), surface_passes=passes,
+            contour_paths=contour_paths, drill_points=drill_points,
         )
+
+    def _update_contour_fields(self, kind: str) -> None:
+        if kind in ("Engrave", "Etch") and hasattr(self, "setups"):
+            QTimer.singleShot(0, lambda: self._maybe_ask_job_type(kind))
+        for widget in (self.profile_side, self.profile_side_label):
+            widget.setVisible(kind == "Profile")
+        for widget in (self.peck_depth, self.peck_depth_label):
+            widget.setVisible(kind in ("Drill", "Ream", "Tap"))
+
+    def _sketch_problems_for(self, feat) -> list:
+        """Check Sketch problems of the sketch an entity belongs to (block tool assignment)."""
+        from basicam.contours import check_sketch
+
+        group = [f for f in self.sketch_workflow.features if (f.owner_sketch_id or "_") == (feat.owner_sketch_id or "_")]
+        return [p for p in check_sketch(group) if not p.entity_ids or feat.feature_id in p.entity_ids]
+
+    def _operation_contour_inputs(self, op) -> tuple[list | None, list | None]:
+        """Pocket / Profile / Trace / Drill: tool-centre paths or drill points from the target's
+        sketch contours (v2 Block 8). (None, None) for the other kinds."""
+        from basicam.contours import build_contours, pocket_rings, profile_path, region_containing
+
+        kind = str(op.kind)
+        if kind not in ("Pocket", "Profile", "Trace", "Drill", "Ream", "Tap", "Engrave"):
+            return None, None
+        feat = next((f for f in self.sketch_workflow.features if op.target in (f.name, f.feature_id)), None)
+        if feat is None or feat.construction or feat.has_error or feat.state != "defined":
+            return None, None
+        group = [
+            f for f in self.sketch_workflow.features
+            if (f.owner_sketch_id or "_") == (feat.owner_sketch_id or "_") and not f.has_error
+        ]
+        contours = build_contours(group)
+        radius = float(op.tool_diameter_mm) / 2.0
+
+        def xy(uv_path):
+            return [(x, y) for x, y, _z in contours.to_world(uv_path)]
+
+        if kind in ("Drill", "Ream", "Tap"):
+            points = [(float(p[0]), float(p[1])) for p, _id in contours.points]
+            return None, points or None
+        if kind == "Trace":
+            from shapely.geometry import LineString
+
+            target_line = LineString([tuple(map(float, contours.plane.world_to_uv(p))) for p in feat.points])
+            chain = min(contours.chains, key=lambda c: c.distance(target_line), default=None)
+            coords = list(chain.coords) if chain is not None and chain.distance(target_line) < 1e-6 else list(target_line.coords)
+            return [xy(coords)], None
+        region = region_containing(contours, {feat.feature_id})
+        if region is None:
+            return None, None
+        if kind == "Pocket":
+            rings = pocket_rings(region, radius, max(0.05, float(op.stepover_ratio)) * float(op.tool_diameter_mm))
+        elif kind == "Engrave":
+            rings = profile_path(region, "On", radius)  # engraving follows the line itself
+        else:
+            rings = profile_path(region, str(op.profile_side), radius)
+        return ([xy(r) for r in rings] or None), None
 
     def _build_full_gcode_program(self, settings, single_op_ref: tuple[int, int] | None = None) -> str:
         if self.sketch_workflow.has_errors() or self._underdefined_tooled_sketches():
@@ -6425,13 +8551,47 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         for op in ops:
             all_segments.extend(self._operation_segments(op, setup, settings))
         self.toolpath_player.set_segments(all_segments)
+        if self._is_lathe():
+            lathe_problems = self.lathe_violations(all_segments)
+            if lathe_problems:
+                for problem in lathe_problems[:10]:
+                    self.terminal_core.log("error", problem.text)
+                raise ValueError("Lathe keep-out refused the program:\n" + "\n".join(p.text for p in lathe_problems[:10]))
+        if self._is_lathe() and all(str(op.kind) in self.LATHE_KINDS for op in ops if ops):
+            program = self._lathe_program(all_segments, ops)
+            self._program_aux_kinds = []
+            return program
+        changer, table = self._tool_changer_and_table()
+        machine_for_aux = getattr(self, "current_machine", None)
+        outputs = machine_for_aux.aux_output_list() if machine_for_aux is not None else [AuxOutput("flood"), AuxOutput("mist")]
+        aux_by_op = {op.name: self._operation_aux(op) for op in ops}
+        missing = tools_not_loaded(changer, table, [op.tool for op in ops])
+        if missing:
+            self.terminal_core.log(
+                "warning",
+                "Not in the tool changer: " + ", ".join(missing) + ". Load them in the tool table, or they are changed by hand (M0).",
+            )
+        inches = str(settings.units_mode).upper() == "G20"
+        safe_z = float(getattr(setup, "safe_z_mm", 10.0) or 10.0) + float(settings.stock_top_z_mm)
+
+        def change(tool_name: str, first: bool) -> list[str]:
+            if first and not changer.automatic:
+                return []  # the first tool is already in the spindle
+            return tool_change_block(changer, table, tool_name, safe_z, inches)
+
         program = self.post_compiler.compile_segments(
             all_segments,
             units_code=str(settings.units_mode),
             manual_spindle=bool(settings.manual_spindle),
             work_offset=str(getattr(setup, "work_offset", "G54")),
+            tool_change_lines=change,
+            op_start_lines=lambda name: aux_lines(outputs, aux_by_op.get(name, []), True),
+            op_end_lines=lambda name: aux_lines(outputs, aux_by_op.get(name, []), False),
         )
-        violations = self.motion_guard.check_program_text(program)
+        self._program_aux_kinds = sorted({k for kinds in aux_by_op.values() for k in kinds})
+        by_name = {t.name: t for t in getattr(self, "tools", [])}
+        by_number = {n: by_name.get(e.tool) for n, e in table.pockets.items() if e.tool in by_name}
+        violations = self.motion_guard.check_program_text(program, tools_by_number=by_number, tools_by_name=by_name)
         if violations:
             self.motion_guard.report(violations, "G-code generation", show_dialog=False)
             raise ValueError(
@@ -7136,6 +9296,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             event_type = event.type()
             if event_type == QEvent.Type.Resize:
                 self._position_view_overlay()
+            if event_type == QEvent.Type.KeyPress and self._handle_sketch_key(event):
+                return True
             if event_type == QEvent.Type.KeyPress and event.key() in (
                 Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down
             ):
@@ -7151,13 +9313,34 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                     if self._over_orientation_cube(self.drag_origin):
                         self.drag_mode = "orientation"
                         return False
+                    if self.sketch_mode.isChecked() and getattr(self, "_modify_mode", None):
+                        self.drag_mode = "modify"
+                        return True
+                    if self.sketch_mode.isChecked() and self._dimension_tool_active():
+                        self._dimension_click(self.drag_origin)
+                        self.drag_mode = ""
+                        return True
+                    if self.sketch_mode.isChecked():
+                        label_hit = self._hit_test_dimension_label(self.drag_origin)
+                        if label_hit is not None:
+                            self._push_history("Move dimension label")
+                            self.dragging_dimension = label_hit
+                            self.drag_mode = "dim_label"
+                            return True
                     if self.sketch_mode.isChecked():
                         hit_handle = self._hit_test_sketch_handle(self.drag_origin)
                         if hit_handle is not None:
+                            self._push_history("Drag sketch")
                             self.dragging_sketch = hit_handle
                             self.active_sketch_id = hit_handle[0]
                             self.drag_mode = "sketch_drag"
                             self._refresh_sketch_tree()
+                            return True
+                        if self._sketch_tool_active():
+                            # Press places a point; a drag-release places the next (click-drag).
+                            self.drag_mode = "sketch_draw"
+                            self._suppress_inference = self.drag_additive
+                            self._add_sketch_click(self.drag_origin)
                             return True
                     self.drag_mode = "select"
                     if self.drag_rubber_band is None:
@@ -7181,9 +9364,15 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                         new_pt = self._world_at_work_plane(position)
                         if new_pt is not None:
                             feat_id, pt_idx = self.dragging_sketch
-                            self.sketch_workflow.move_feature_point(feat_id, pt_idx, new_pt)
+                            self._drag_sketch_point(feat_id, pt_idx, new_pt)
                             self._refresh_sketch_tree()
                             self._refresh_scene(reset_camera=False)
+                    return True
+                if self.drag_mode == "sketch_draw" and event.buttons() & Qt.MouseButton.LeftButton:
+                    self._update_sketch_preview(position)
+                    return True
+                if self.drag_mode == "dim_label" and event.buttons() & Qt.MouseButton.LeftButton:
+                    self._move_dimension_label(self.dragging_dimension, position)
                     return True
                 if self.drag_mode == "select" and event.buttons() & Qt.MouseButton.LeftButton:
                     self.drag_current = position
@@ -7201,8 +9390,36 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                     self.drag_current = position
                     self._orbit_camera(delta)
                     return True
+                if self.sketch_mode.isChecked() and not event.buttons():
+                    self._update_sketch_preview(position)
                 self._show_hover_note(event)
+            elif event_type == QEvent.Type.MouseButtonDblClick:
+                if event.button() == Qt.MouseButton.LeftButton and self.sketch_mode.isChecked():
+                    label_hit = self._hit_test_dimension_label(event.position().toPoint())
+                    if label_hit is not None:
+                        self._edit_dimension_label(label_hit, event.position().toPoint())
+                        self.drag_mode = ""
+                        return True
+                    if self._end_sketch_chain():
+                        self.drag_mode = ""
+                        return True
             elif event_type == QEvent.Type.MouseButtonRelease:
+                if self.drag_mode == "modify" and event.button() == Qt.MouseButton.LeftButton:
+                    self.drag_mode = ""
+                    self._modify_click(self.drag_origin, event.position().toPoint())
+                    return True
+                if self.drag_mode == "dim_label" and event.button() == Qt.MouseButton.LeftButton:
+                    self.drag_mode = ""
+                    self.dragging_dimension = None
+                    self._refresh_scene(reset_camera=False)
+                    return True
+                if self.drag_mode == "sketch_draw" and event.button() == Qt.MouseButton.LeftButton:
+                    end = event.position().toPoint()
+                    if (end - self.drag_origin).manhattanLength() >= self.drag_threshold and self.pending_sketch_points:
+                        self._add_sketch_click(end)
+                    self._suppress_inference = False
+                    self.drag_mode = ""
+                    return True
                 if self.drag_mode == "sketch_drag" and event.button() == Qt.MouseButton.LeftButton:
                     self.dragging_sketch = None
                     self.drag_mode = ""
@@ -7234,6 +9451,9 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                     return True
                 if self.drag_mode == "orbit" and event.button() == Qt.MouseButton.RightButton:
                     self.drag_mode = ""
+                    still = (event.position().toPoint() - self.drag_origin).manhattanLength() < self.drag_threshold
+                    if still and self.sketch_mode.isChecked() and (self.sketch_chain.active or self.pending_sketch_points):
+                        self._end_sketch_chain()  # right-click > End chain
                     return True
             elif event_type == QEvent.Type.Wheel:
                 self._zoom_camera(event.angleDelta().y())
@@ -7497,12 +9717,52 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         raw_pt = near + ray * distance
 
         anchor = self.pending_sketch_points[-1] if self.pending_sketch_points else None
-        snapped_pt, _snap_cand, _constraints = self.sketch_workflow.resolve_snap(
+        vertices, edges = self._model_snap_sources()
+        snapped_pt, snap, _constraints = self.sketch_workflow.resolve_snap(
             raw_pt,
             anchor_point=anchor,
-            part_meshes=(p.mesh for p in self.parts if p.mesh is not None),
+            tolerance=self._snap_radius_px() * self._mm_per_pixel(raw_pt),
+            model_vertices=vertices,
+            model_edges=edges,
         )
+        self._last_snap = snap
         return plane.project_point_to_plane(snapped_pt)
+
+    def _snap_radius_px(self) -> float:
+        try:
+            return max(1.0, float(self.settings.value("sketch/snap_radius_px", 10.0)))
+        except (TypeError, ValueError):
+            return 10.0
+
+    def _mm_per_pixel(self, world_point) -> float:
+        """World size of one screen pixel at ``world_point`` (snap radius in pixels, spec B5)."""
+        plane = self.sketch_workflow.active_plane
+        try:
+            point = np.asarray(world_point, dtype=float)
+            step = np.asarray(plane.u_axis if plane is not None else (1.0, 0.0, 0.0), dtype=float)
+            a = self._project_world_point(point)
+            b = self._project_world_point(point + step)
+            pixels = math.hypot(b[0] - a[0], b[1] - a[1]) / max(self.plotter.interactor.devicePixelRatioF(), 1e-6)
+            if pixels > 1e-9 and math.isfinite(pixels):
+                return 1.0 / pixels
+        except Exception:
+            pass
+        return float(self.sketch_workflow.snap_settings.snap_radius_mm) / 10.0
+
+    def _model_snap_sources(self) -> tuple[list, list]:
+        """(part index, vertices) and (part index, edge segments) of the model, cached per mesh."""
+        vertices, edges = [], []
+        for index, part in enumerate(self.parts):
+            if part.role is PartRole.STOCK or part.mesh is None or part.mesh.n_points == 0:
+                continue
+            key = (id(part.mesh), id(getattr(part, "edge_mesh", None)))
+            cached = self._model_snap_cache.get(index)
+            if cached is None or cached[0] != key:
+                cached = (key, *_model_vertices_and_edges(part))
+                self._model_snap_cache[index] = cached
+            vertices.append((index, cached[1]))
+            edges.append((index, cached[2]))
+        return vertices, edges
 
     def _finish_pending_spline(self) -> None:
         if len(self.pending_sketch_points) < 2:
@@ -7527,15 +9787,580 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self._refresh_sketch_tree()
         self._refresh_scene(reset_camera=False)
 
+    # ------------------------------------------------------------ drawing interaction (Block 4)
+    @staticmethod
+    def _ref_index_at(feat, point, tolerance: float = 1e-5) -> int | None:
+        """Solver point index of `feat` at `point` (None when no reference point is there)."""
+        from basicam.sketch_solver import reference_points
+
+        refs = reference_points(feat)
+        if not refs:
+            return None
+        distances = [float(np.linalg.norm(np.asarray(r) - np.asarray(point))) for r in refs]
+        index = int(np.argmin(distances))
+        return index if distances[index] <= tolerance else None
+
+    def _relation_from_snap(self, feat, point_index: int, snap) -> Relation | None:
+        """The automatic relation for a click that snapped (spec B4); None when not applicable."""
+        kind = relation_for_snap(getattr(snap, "kind", None))
+        if kind is None or self._suppress_inference:
+            return None
+        fid = feat.feature_id
+        if kind == "anchor_model":
+            return Relation("anchor_model", [(fid, point_index)], [float(c) for c in snap.point], part_index=snap.part_index)
+        if kind == "on_edge":
+            segment = np.asarray(snap.segment, dtype=float).reshape(-1).tolist()
+            return Relation("on_edge", [(fid, point_index)], segment, part_index=snap.part_index)
+        other = self.sketch_workflow.get_feature(snap.entity_id)
+        if other is None or other is feat:
+            return None
+        if kind == "coincident":
+            other_index = self._ref_index_at(other, snap.point)
+            if other_index is None:
+                return None
+            relation = "concentric" if (snap.kind == "Center" and feat.kind == "Circle" and point_index == 0) else "coincident"
+            return Relation(relation, [(fid, point_index), (other.feature_id, other_index)])
+        if kind == "midpoint" and other.kind in ("Line", "Construction line"):
+            return Relation("midpoint", [(fid, point_index), (other.feature_id, None)])
+        if kind == "on_curve" and other.kind in ("Line", "Construction line", "Circle", "Curve"):
+            return Relation("on_curve", [(fid, point_index), (other.feature_id, None)])
+        return None
+
+    def _apply_click_snaps(self, feat, clicks: list, snaps: list) -> list:
+        """Create the inferred relations of a new entity from the snaps of its clicks."""
+        made = []
+        snapped_ends = 0
+        for click, snap in zip(clicks, snaps):
+            if snap is None:
+                continue
+            index = self._ref_index_at(feat, click)
+            if index is None:
+                continue
+            relation = self._relation_from_snap(feat, index, snap)
+            if relation is not None:
+                self.sketch_workflow.relations.append(relation)
+                made.append(relation)
+                snapped_ends += 1
+        if not self._suppress_inference and feat.kind == "Line" and len(feat.points) >= 2 and snapped_ends < 2:
+            from basicam.sketch_solver import plane_for
+
+            # The solver's own sketch axes decide what horizontal and vertical mean.
+            hv = hv_relation(feat.points[0], feat.points[-1], plane_for([feat]))
+            if hv is not None:
+                relation = Relation(hv, [(feat.feature_id, None)], auto=True)
+                self.sketch_workflow.relations.append(relation)
+                made.append(relation)
+        return made
+
+    def _add_chain_click(self, point, snap, plane, plane_label: str) -> None:
+        """Line tool: every click continues the chain from the last end point (spec B4)."""
+        chain = self.sketch_chain
+        if not self.pending_sketch_points:
+            self.pending_sketch_points.append(np.asarray(point, dtype=float))
+            self._click_snaps = [snap]
+            self.statusBar().showMessage("Line: click the next point (double-click, Esc or right-click ends the chain).", 4000)
+            self._update_sketch_preview_world(point)
+            return
+        start = np.asarray(self.pending_sketch_points[-1], dtype=float)
+        point = np.asarray(point, dtype=float)
+        if float(np.linalg.norm(point - start)) < 1e-9:
+            return
+        tolerance = self._snap_radius_px() * self._mm_per_pixel(point)
+        closing = chain.closes_at(point, tolerance)
+        if closing:
+            point = np.asarray(chain.start_point, dtype=float)
+        self._push_history("Add sketch feature")
+        manager = self.sketch_workflow
+        previous = manager.get_feature(chain.last_entity) if chain.active else None
+        pts = None
+        if chain.tangent_next and previous is not None and len(previous.points) >= 2:
+            prev_pts = np.asarray(previous.points, dtype=float)
+            pts = tangent_arc_points(start, prev_pts[-1] - prev_pts[-2], point, plane)
+        if pts is not None and len(pts) > 2:
+            feat = manager.create_feature("Curve", plane_label, pts, parent_feature_id=None, variant="Tangent arc")
+        else:
+            feat = manager.create_feature("Line", plane_label, np.vstack((start, point)), parent_feature_id=None)
+        start_index = self._ref_index_at(feat, start)
+        end_index = self._ref_index_at(feat, point)
+        if previous is not None:
+            previous_end = self._ref_index_at(previous, start)
+            if previous_end is not None and start_index is not None:
+                manager.relations.append(Relation("coincident", [(previous.feature_id, previous_end), (feat.feature_id, start_index)]))
+            if feat.kind == "Curve":
+                manager.relations.append(Relation("tangent", [(feat.feature_id, None), (previous.feature_id, None)]))
+            first_snaps = [None]
+        else:
+            first_snaps = [self._click_snaps[0] if self._click_snaps else None]
+        if closing:
+            first = manager.get_feature(chain.first_entity)
+            first_start = self._ref_index_at(first, point) if first is not None else None
+            if first_start is not None and end_index is not None:
+                manager.relations.append(Relation("coincident", [(feat.feature_id, end_index), (first.feature_id, first_start)]))
+            self._apply_click_snaps(feat, [start], first_snaps)
+        else:
+            self._apply_click_snaps(feat, [start, point], first_snaps + [snap])
+        self.active_sketch_id = feat.feature_id
+        if closing:
+            chain.reset()
+            self.pending_sketch_points.clear()
+            self._click_snaps.clear()
+            self.statusBar().showMessage("Closed the chain.", 3000)
+        else:
+            chain.add(feat.feature_id, start)
+            self.pending_sketch_points = [point]
+            self._click_snaps = [snap]
+        self.sketch_visible.setChecked(True)
+        self._refresh_sketch_tree()
+        self._refresh_scene(reset_camera=False)
+
+    def _end_sketch_chain(self) -> bool:
+        """Double-click / right-click / Esc: end the line chain (or finish a spline)."""
+        if self.sketch_kind.currentText() == "Spline" and len(self.pending_sketch_points) >= 2:
+            self._finish_pending_spline()
+            return True
+        if self.sketch_chain.active or self.pending_sketch_points:
+            self.sketch_chain.reset()
+            self.pending_sketch_points.clear()
+            self._click_snaps.clear()
+            self._typed_value = ""
+            self._hide_sketch_readout()
+            self._refresh_scene(reset_camera=False)
+            self.statusBar().showMessage("Chain ended.", 2000)
+            return True
+        return False
+
+    def _sketch_tool_active(self) -> bool:
+        group = getattr(self, "sketch_tool_group", None)
+        return bool(self.sketch_mode.isChecked() and group is not None and group.checkedButton() is not None)
+
+    def _hide_sketch_readout(self) -> None:
+        label = getattr(self, "_sketch_readout", None)
+        if label is not None:
+            label.hide()
+
+    def _update_sketch_preview(self, position: QPoint) -> None:
+        """Rubber band: the entity in progress follows the cursor; snap marker while hovering."""
+        if not self.sketch_mode.isChecked():
+            return
+        self._last_snap = None
+        world = self._world_at_work_plane(position)
+        if world is None:
+            return
+        self._update_sketch_preview_world(world, position)
+
+    def _update_sketch_preview_world(self, world, position: QPoint | None = None) -> None:
+        plane = self.sketch_workflow.active_plane
+        self._last_cursor_world = np.asarray(world, dtype=float)
+        tool = self.sketch_kind.currentText()
+        variant = self.sketch_variant.currentText() if hasattr(self, "sketch_variant") else ""
+        geometry = None
+        if self.pending_sketch_points:
+            if tool == "Line" and self.sketch_chain.tangent_next and self.sketch_chain.active:
+                previous = self.sketch_workflow.get_feature(self.sketch_chain.last_entity)
+                if previous is not None and len(previous.points) >= 2:
+                    prev = np.asarray(previous.points, dtype=float)
+                    geometry = tangent_arc_points(self.pending_sketch_points[-1], prev[-1] - prev[-2], world, plane)
+            if geometry is None:
+                geometry = preview_geometry(tool, variant, self.pending_sketch_points, world, plane)
+        try:
+            if geometry is not None and len(geometry) >= 2:
+                self.plotter.add_mesh(
+                    pv.lines_from_points(np.asarray(geometry, dtype=float)), name="sketch-preview",
+                    color=theme_color("highlight"), line_width=2, pickable=False, render=False,
+                )
+            else:
+                self.plotter.remove_actor("sketch-preview", render=False)
+            snap = self._last_snap
+            if snap is not None:
+                self.plotter.add_points(
+                    np.asarray(snap.point, dtype=float).reshape(1, 3), name="sketch-snap-marker",
+                    color=theme_color("selection"), point_size=12, render_points_as_spheres=True,
+                    pickable=False, render=False,
+                )
+            else:
+                self.plotter.remove_actor("sketch-snap-marker", render=False)
+            self.plotter.render()
+        except Exception:
+            pass
+        text = cursor_readout(tool, variant, self.pending_sketch_points, world, plane, self.units.display.value)
+        if self._typed_value:
+            text = f"{text} · typed {self._typed_value}" if text else f"typed {self._typed_value}"
+        if self._last_snap is not None:
+            text = f"{text} · {self._last_snap.label}" if text else self._last_snap.label
+        self._show_sketch_readout(text, position)
+
+    def _show_sketch_readout(self, text: str, position: QPoint | None) -> None:
+        if not text:
+            self._hide_sketch_readout()
+            return
+        label = getattr(self, "_sketch_readout", None)
+        if label is None:
+            label = QLabel(self.plotter.interactor)
+            label.setObjectName("sketchReadout")
+            label.setStyleSheet("background: rgba(20,20,20,200); color: white; padding: 2px 6px; border-radius: 3px;")
+            label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._sketch_readout = label
+        label.setText(text)
+        label.adjustSize()
+        if position is not None:
+            label.move(position.x() + 16, position.y() + 16)
+        label.show()
+
+    def _handle_sketch_key(self, event) -> bool:
+        """Typed length / radius while drawing; "A" switches the next chain segment to a tangent arc."""
+        if not (self.sketch_mode.isChecked() and self.pending_sketch_points):
+            return False
+        key, text = event.key(), event.text()
+        tool = self.sketch_kind.currentText()
+        if key == Qt.Key.Key_A and tool == "Line" and self.sketch_chain.active and not self._typed_value:
+            self.sketch_chain.tangent_next = not self.sketch_chain.tangent_next
+            self.statusBar().showMessage(
+                "Next segment: tangent arc." if self.sketch_chain.tangent_next else "Next segment: line.", 2500
+            )
+            return True
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self._typed_value:
+            self._apply_typed_value()
+            return True
+        if key == Qt.Key.Key_Backspace and self._typed_value:
+            self._typed_value = self._typed_value[:-1]
+            return True
+        if tool in ("Line", "Circle") and text and (text.isdigit() or text in ".-/ \"'" or text.isalpha()):
+            if text.isalpha() and not self._typed_value:
+                return False
+            self._typed_value += text
+            self.statusBar().showMessage(f"Value: {self._typed_value} (Enter applies)", 3000)
+            return True
+        return False
+
+    def _apply_typed_value(self) -> None:
+        tool = self.sketch_kind.currentText()
+        value = parse_typed_length(self._typed_value, self.units.display.value)
+        self._typed_value = ""
+        plane = self.sketch_workflow.active_plane
+        if value is None or value <= 0 or plane is None or not self.pending_sketch_points:
+            self.statusBar().showMessage("Type a length such as 25, 25mm or 1in, then Enter.", 4000)
+            return
+        start = np.asarray(self.pending_sketch_points[-1 if tool == "Line" else 0], dtype=float)
+        cursor = self._last_cursor_world
+        direction = (cursor - start) if cursor is not None else np.asarray(plane.u_axis, dtype=float)
+        norm = float(np.linalg.norm(direction))
+        direction = direction / norm if norm > 1e-9 else np.asarray(plane.u_axis, dtype=float)
+        end = start + direction * value
+        count = len(self.sketch_workflow.features)
+        self._add_sketch_click(QPoint(), world=end)
+        if len(self.sketch_workflow.features) > count:
+            feat = self.sketch_workflow.features[-1]
+            self.sketch_workflow.set_entity_dimension(
+                feat.feature_id, value * (2.0 if feat.kind == "Circle" else 1.0), self.units.display.value
+            )
+            self._solve_sketches()
+            self._refresh_sketch_tree()
+            self._refresh_scene(reset_camera=False)
+
+    # ------------------------------------------------------------ Smart Dimension (v2 Block 6)
+    def _dimension_tool_active(self) -> bool:
+        button = getattr(self, "smart_dimension_btn", None)
+        return bool(button is not None and button.isChecked() and self.sketch_mode.isChecked())
+
+    def _toggle_dimension_tool(self, on: bool) -> None:
+        self._cancel_dimension()
+        if on:
+            group = self.sketch_tool_group
+            if group.checkedButton() is not None:
+                group.setExclusive(False)
+                group.checkedButton().setChecked(False)
+                group.setExclusive(True)
+            self.pending_sketch_points.clear()
+            self.sketch_chain.reset()
+            self.statusBar().showMessage("Smart Dimension: pick an entity or point (a second for distance or angle).", 5000)
+
+    def _cancel_dimension(self) -> None:
+        self._dim_picks = []
+        self._dim_plan = None
+        self._pending_dimension = None
+        self._editing_dimension = None
+        editor = getattr(self, "_dimension_editor", None)
+        if editor is not None:
+            editor.hide()
+        if hasattr(self, "plotter"):
+            self.plotter.remove_actor("dimension-preview", render=False)
+
+    def _features_by_id(self) -> dict:
+        return {f.feature_id: f for f in self.sketch_workflow.features}
+
+    def _sketch_pick_at(self, position: QPoint, tolerance_px: float = 8.0):
+        """The sketch point (reference point) or entity under the cursor, as a Pick."""
+        from basicam.sketch_dimensions import Pick
+        from basicam.sketch_solver import reference_points
+
+        scale = self.plotter.interactor.devicePixelRatioF()
+        height = self.plotter.render_window.GetSize()[1]
+        cx, cy = float(position.x() * scale), float(height - position.y() * scale)
+        best_point, best_entity = None, None
+        for feat in self.sketch_workflow.features:
+            if not self.sketch_workflow.can_edit(feat):
+                continue
+            for index, ref in enumerate(reference_points(feat)):
+                dx, dy, _ = self._project_world_point(np.asarray(ref, dtype=float))
+                d = math.hypot(dx - cx, dy - cy)
+                if d <= tolerance_px * scale and (best_point is None or d < best_point[0]):
+                    best_point = (d, Pick(feat.feature_id, feat.kind, index if feat.kind != "Point" else None))
+            pts = np.asarray(feat.points, dtype=float)
+            if len(pts) >= 2:
+                screen = [self._project_world_point(p)[:2] for p in pts]
+                for (ax, ay), (bx, by) in zip(screen[:-1], screen[1:]):
+                    abx, aby = bx - ax, by - ay
+                    denom = abx * abx + aby * aby
+                    t = 0.0 if denom < 1e-12 else max(0.0, min(1.0, ((cx - ax) * abx + (cy - ay) * aby) / denom))
+                    d = math.hypot(ax + abx * t - cx, ay + aby * t - cy)
+                    if d <= tolerance_px * scale and (best_entity is None or d < best_entity[0]):
+                        best_entity = (d, Pick(feat.feature_id, feat.kind, None))
+        if best_point is not None and (best_entity is None or best_point[0] <= best_entity[0] + 2.0 * scale):
+            return best_point[1]
+        return best_entity[1] if best_entity is not None else None
+
+    def _dimension_click(self, position: QPoint) -> None:
+        from basicam.sketch_dimensions import infer_dimension
+
+        pick = self._sketch_pick_at(position)
+        if pick is not None and len(self._dim_picks) < 2:
+            if any(p.entity_id == pick.entity_id and p.point_index == pick.point_index for p in self._dim_picks):
+                return
+            plan = infer_dimension(self._dim_picks + [pick])
+            if plan is not None:
+                self._dim_picks.append(pick)
+                self._dim_plan = plan
+                self.statusBar().showMessage("Click where the dimension goes, or pick a second entity.", 4000)
+                return
+        if self._dim_plan is None:
+            self.statusBar().showMessage("Pick a line, circle, arc or point to dimension.", 3000)
+            return
+        world = self._world_at_work_plane(position)
+        if world is not None:
+            self._place_dimension(world, position)
+
+    def _place_dimension(self, world, position: QPoint | None = None) -> dict | None:
+        """Placement click: settle the dimension type from the mouse and open the value box."""
+        from basicam.sketch_dimensions import label_anchor_uv, measure, refine_plan
+        from basicam.sketch_solver import plane_for
+
+        if self._dim_plan is None:
+            return None
+        features = self._features_by_id()
+        group = [features[t] for t in self._dim_plan.targets if t in features]
+        plane = plane_for(group)
+        mouse_uv = np.asarray(plane.world_to_uv(np.asarray(world, dtype=float)), dtype=float)
+        plan = refine_plan(self._dim_plan, features, mouse_uv)
+        anchor = label_anchor_uv(plan.kind, plan.targets, plan.point_refs, features)
+        offset = (mouse_uv - anchor).tolist() if anchor is not None else [0.0, 0.0]
+        measured = measure(plan.kind, plan.targets, plan.point_refs, features)
+        self._pending_dimension = {"plan": plan, "offset": offset, "measured": measured}
+        self._open_dimension_editor(measured, plan.angular or plan.kind == "Angle", position)
+        return self._pending_dimension
+
+    def _open_dimension_editor(self, value: float | None, angular: bool, position: QPoint | None) -> None:
+        editor = self._dimension_editor
+        if editor is None:
+            editor = QLineEdit(self.plotter.interactor)
+            editor.setObjectName("dimensionValueBox")
+            editor.setPlaceholderText("value, e.g. 25, 1/2in*2")
+            editor.setFixedWidth(170)
+            editor.returnPressed.connect(lambda: self._commit_dimension(self._dimension_editor.text()))
+            self._dimension_editor = editor
+        if value is None:
+            editor.setText("")
+        elif angular:
+            editor.setText(f"{value:.3f}")
+        else:
+            shown = value / 25.4 if self.units.display is LengthUnit.INCHES else value
+            editor.setText(f"{shown:.4f}".rstrip("0").rstrip("."))
+        if position is not None:
+            editor.move(position.x() + 12, position.y() + 12)
+        editor.show()
+        editor.selectAll()
+        editor.setFocus()
+
+    def _commit_dimension(self, text: str):
+        """Enter in the value box: add the dimension (or edit the one double-clicked)."""
+        from basicam.sketch_dimensions import parse_dimension_expression
+
+        default_mm = 25.4 if self.units.display is LengthUnit.INCHES else 1.0
+        if self._editing_dimension is not None:
+            feature_id, dim_id = self._editing_dimension
+            feat = self.sketch_workflow.get_feature(feature_id)
+            dim = next((d for d in (feat.dimensions if feat else []) if d.dim_id == dim_id), None)
+            value = parse_dimension_expression(text, default_mm, angular=dim is not None and dim.kind == "Angle")
+            self._cancel_dimension()
+            if dim is None or value is None:
+                return None
+            self._push_history("Edit sketch dimension")
+            dim.value = float(value)
+            dim.driving = True
+            self._refresh_sketch_tree()
+            self._refresh_scene(reset_camera=False)
+            return dim
+        pending = self._pending_dimension
+        if pending is None:
+            return None
+        plan = pending["plan"]
+        value = parse_dimension_expression(text, default_mm, angular=plan.kind == "Angle")
+        if value is None or (plan.kind != "Angle" and plan.kind not in ("X", "Y", "Z") and value <= 0):
+            self.statusBar().showMessage(f"Could not read '{text}'. Try 25, 25mm, 1/2in*2 or (3 ft)/4.", 5000)
+            return None
+        owner = self.sketch_workflow.get_feature(plan.owner)
+        if owner is None:
+            self._cancel_dimension()
+            return None
+        unit_text, sig_figs = describe_length_text(text, self.units.display.value)
+        number = sum(len(f.dimensions) for f in self.sketch_workflow.features) + 1
+        dim = SketchDimension(
+            f"{owner.feature_id}_{plan.kind.lower()}_{number}", plan.kind, plan.kind, float(value),
+            target_ids=list(plan.targets), point_refs=list(plan.point_refs),
+            label_offset=[float(c) for c in pending["offset"]], unit_text=unit_text, sig_figs=sig_figs,
+        )
+        self._push_history("Add dimension")
+        owner.dimensions.append(dim)
+        self._cancel_dimension()
+        self._refresh_sketch_tree()
+        result = (getattr(self, "_last_solve_results", {}) or {}).get(owner.owner_sketch_id or "_")
+        if result is not None and result.state == "error":
+            reply = QMessageBox.question(
+                self, "Over-defined sketch",
+                "This dimension over-defines the sketch. Make this dimension driven?\n\n"
+                "Yes: it only reports the geometry. No: keep it driving (the sketch stays in error until fixed).",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                dim.driving = False
+                self._refresh_sketch_tree()
+        self._refresh_scene(reset_camera=False)
+        return dim
+
+    def _update_driven_dimensions(self) -> None:
+        from basicam.sketch_dimensions import measure
+
+        features = self._features_by_id()
+        for feat in self.sketch_workflow.features:
+            for dim in feat.dimensions:
+                if not dim.driving and dim.target_ids:
+                    value = measure(dim.kind, dim.target_ids, dim.point_refs, features)
+                    if value is not None:
+                        dim.value = float(value)
+
+    def _dimension_labels(self) -> list[tuple[str, str, np.ndarray, list, str]]:
+        """(feature id, dim id, label position, segments, text) of every drawable dimension."""
+        from basicam.sketch_dimensions import label_geometry, label_text
+
+        features = self._features_by_id()
+        unit = self.units.display.value
+        out = []
+        for feat in self.sketch_workflow.features:
+            for dim in feat.dimensions:
+                targets = dim.target_ids or [feat.feature_id]
+                try:
+                    segments, label = label_geometry(dim.kind, targets, dim.point_refs, dim.label_offset, features)
+                except (IndexError, ValueError, KeyError):
+                    continue
+                if label is None:
+                    continue
+                out.append((feat.feature_id, dim.dim_id, np.asarray(label, dtype=float), segments, label_text(dim.kind, dim.value, dim.driving, unit)))
+        return out
+
+    def _draw_dimensions(self) -> None:
+        labels = self._dimension_labels()
+        if not labels:
+            return
+        segments = [s for _f, _d, _p, segs, _t in labels for s in segs if len(s) == 2]
+        if segments:
+            lines = pv.PolyData()
+            points = np.vstack(segments)
+            lines.points = points
+            lines.lines = np.hstack([[2, 2 * i, 2 * i + 1] for i in range(len(segments))])
+            self.plotter.add_mesh(lines, color=theme_color("muted"), line_width=1.0, name="sketch-dimension-lines", pickable=False)
+        self.plotter.add_point_labels(
+            np.vstack([p for _f, _d, p, _s, _t in labels]), [t for *_r, t in labels], name="sketch-dimension-labels",
+            font_size=12, text_color=theme_color("text"), shape_opacity=0.0, show_points=False,
+            always_visible=True, pickable=False,
+        )
+
+    def _hit_test_dimension_label(self, position: QPoint, tolerance_px: float = 14.0) -> tuple[str, str] | None:
+        if not hasattr(self, "plotter") or self.plotter.render_window.GetSize()[1] == 0:
+            return None
+        scale = self.plotter.interactor.devicePixelRatioF()
+        height = self.plotter.render_window.GetSize()[1]
+        cx, cy = float(position.x() * scale), float(height - position.y() * scale)
+        best = None
+        for feature_id, dim_id, label, _segments, _text in self._dimension_labels():
+            dx, dy, _ = self._project_world_point(label)
+            d = math.hypot(dx - cx, dy - cy)
+            if d <= tolerance_px * scale and (best is None or d < best[0]):
+                best = (d, (feature_id, dim_id))
+        return best[1] if best else None
+
+    def _move_dimension_label(self, hit: tuple[str, str] | None, position: QPoint) -> None:
+        from basicam.sketch_dimensions import label_anchor_uv
+        from basicam.sketch_solver import plane_for
+
+        if hit is None:
+            return
+        feat = self.sketch_workflow.get_feature(hit[0])
+        dim = next((d for d in (feat.dimensions if feat else []) if d.dim_id == hit[1]), None)
+        world = self._world_at_work_plane(position)
+        if dim is None or world is None:
+            return
+        features = self._features_by_id()
+        targets = dim.target_ids or [feat.feature_id]
+        anchor = label_anchor_uv(dim.kind, targets, dim.point_refs, features)
+        if anchor is None:
+            return
+        plane = plane_for([features[t] for t in targets if t in features])
+        dim.label_offset = (np.asarray(plane.world_to_uv(world), dtype=float) - anchor).tolist()
+        self._refresh_scene(reset_camera=False)
+
+    def _edit_dimension_label(self, hit: tuple[str, str], position: QPoint | None = None) -> None:
+        feat = self.sketch_workflow.get_feature(hit[0])
+        dim = next((d for d in (feat.dimensions if feat else []) if d.dim_id == hit[1]), None)
+        if dim is None:
+            return
+        self._cancel_dimension()
+        self._editing_dimension = hit
+        self._open_dimension_editor(dim.value, dim.kind == "Angle", position)
+
+    def _create_slot(self, c1, c2, width_point, plane, plane_label: str, construction: bool):
+        """Straight slot: arc centres c1, c2; the third click sets the half width."""
+        u1, u2, uw = (np.asarray(plane.world_to_uv(p), dtype=float) for p in (c1, c2, width_point))
+        axis = u2 - u1
+        length = float(np.linalg.norm(axis))
+        if length < 1e-6:
+            self.statusBar().showMessage("The slot's two centres are at the same place.", 4000)
+            return None
+        normal = np.array([-axis[1], axis[0]]) / length
+        half = abs(float(np.dot(uw - u1, normal)))
+        if half < 1e-6:
+            self.statusBar().showMessage("Move the third click off the slot's centre line to set its width.", 4000)
+            return None
+        control, outline = sample_slot(c1, c2, 2.0 * half, plane)
+        self._push_history("Add sketch feature")
+        return self.sketch_workflow.create_feature(
+            "Slot", plane_label, outline, construction=construction,
+            parent_feature_id=None, variant="Straight", control_points=control,
+        )
+
     def _sketch_clicks_needed(self, kind: str) -> int:
         variant = self.sketch_variant.currentText() if hasattr(self, "sketch_variant") else ""
         if kind == "Point":
             return 1
-        if kind == "Curve" or (kind in {"Rectangle", "Circle"} and variant == "3 point"):
+        if kind in ("Curve", "Slot") or (kind in {"Rectangle", "Circle"} and variant == "3 point"):
             return 3
         return 2
 
-    def _add_sketch_click(self, position: QPoint) -> None:
+    def _add_sketch_click(self, position: QPoint, world: np.ndarray | None = None) -> None:
+        if getattr(self, "_repick_relation_id", None):
+            self._last_snap = None
+            if world is None:
+                self._world_at_work_plane(position)
+            self._finish_repick(self._last_snap)
+            return
         if self.sketch_workflow.has_errors():
             QMessageBox.warning(
                 self,
@@ -7543,7 +10368,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 "Resolve or revert existing red sketch errors before adding new sketch geometry.",
             )
             return
-        point = self._world_at_work_plane(position)
+        self._last_snap = None
+        point = np.asarray(world, dtype=float) if world is not None else self._world_at_work_plane(position)
         if point is None:
             self.statusBar().showMessage("The view ray is parallel to the active sketch plane.", 3500)
             return
@@ -7552,6 +10378,13 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         plane = self.sketch_workflow.active_plane
         plane_label = plane.name if plane else self.work_plane.currentText()
         is_const = bool(getattr(self, "sketch_construction_toggle", None) and self.sketch_construction_toggle.isChecked())
+        snap = self._last_snap
+        if kind == "Line" and not is_const:
+            self._add_chain_click(point, snap, plane, plane_label)
+            return
+        clicks_before = list(self.pending_sketch_points)
+        count_before = len(self.sketch_workflow.features)
+        self._click_snaps.append(snap)
 
         if kind == "Point":
             self._push_history("Add sketch feature")
@@ -7570,13 +10403,22 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 4000,
             )
             return
-        elif kind in {"Curve", "Rectangle", "Circle"} and self._sketch_clicks_needed(kind) == 3:
+        elif kind in {"Curve", "Rectangle", "Circle", "Slot"} and self._sketch_clicks_needed(kind) == 3:
             self.pending_sketch_points.append(point)
             variant = self.sketch_variant.currentText()
             if len(self.pending_sketch_points) < 3:
                 self.statusBar().showMessage(f"{kind} ({variant}): point {len(self.pending_sketch_points)}/3 set.")
                 return
             p1, p2, p3 = self.pending_sketch_points[-3:]
+            if kind == "Slot":
+                feat = self._create_slot(p1, p2, p3, plane, plane_label, is_const)
+                self.pending_sketch_points.clear()
+                if feat is not None:
+                    self.active_sketch_id = feat.feature_id
+                self.sketch_visible.setChecked(True)
+                self._refresh_sketch_tree()
+                self._refresh_scene(reset_camera=False)
+                return
             if kind == "Curve":
                 pts = sample_center_arc(p1, p2, p3, plane) if variant == "Center arc" else sample_three_point_arc(p1, p2, p3, plane)
             elif kind == "Rectangle":
@@ -7627,6 +10469,23 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                     parent_feature_id=None,
                     variant=variant,
                 )
+            elif kind == "Polygon":
+                try:
+                    sides = int(variant.split()[0])
+                except (ValueError, IndexError):
+                    sides = 6
+                control, outline = sample_polygon(first, second, sides, plane)
+                self._push_history("Add sketch feature")
+                feat = self.sketch_workflow.create_feature(
+                    "Polygon", plane_label, outline, construction=is_const,
+                    parent_feature_id=None, variant=variant, control_points=control,
+                )
+            elif kind == "Centerline":
+                self._push_history("Add sketch feature")
+                feat = self.sketch_workflow.create_feature(
+                    "Construction line", plane_label, np.vstack((first, second)),
+                    construction=True, parent_feature_id=None, variant="Centerline",
+                )
             elif kind == "Construction line" or is_const:
                 bounds = np.asarray(self.plotter.bounds).reshape(3, 2)
                 extent = max(float(np.linalg.norm(bounds[:, 1] - bounds[:, 0])) * 2, 10.0)
@@ -7650,6 +10509,10 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.active_sketch_id = feat.feature_id
             self.pending_sketch_points.clear()
 
+        if len(self.sketch_workflow.features) > count_before:
+            self._apply_click_snaps(self.sketch_workflow.features[-1], clicks_before + [point], list(self._click_snaps))
+        if not self.pending_sketch_points:
+            self._click_snaps.clear()
         self.sketch_visible.setChecked(True)
         self._refresh_sketch_tree()
         self._refresh_scene(reset_camera=False)
@@ -7702,7 +10565,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.sketch_tree.setProperty("_context_menu_wired", True)
 
         self.sketch_workflow.sync_tooling_assignments(self.setups)
-        self._solve_sketches()
+        self._last_solve_results = self._solve_sketches()
+        self._update_driven_dimensions()
         self._check_assignment_memory()
         self.sketch_tree.blockSignals(True)
         self.sketch_tree.clear()
@@ -7763,6 +10627,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 self.sketch_error_banner.show()
             else:
                 self.sketch_error_banner.hide()
+        self._refresh_relations_panel()
 
     def _show_sketch_tree_context_menu(self, pos: QPoint) -> None:
         item = self.sketch_tree.itemAt(pos)
@@ -7854,6 +10719,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             return None
         refs: list[tuple[str, int | None]] = []
         value = None
+        anchor_part: int | None = None
         if kind in {"horizontal", "vertical", "fix"}:
             refs = [(feats[0].feature_id, None)]
         elif kind == "anchor_origin":
@@ -7865,7 +10731,13 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 self.statusBar().showMessage("No model geometry to anchor to.", 4000)
                 return None
             allv = np.vstack(vertices)
-            value = allv[int(np.argmin(np.linalg.norm(allv - point, axis=1)))].tolist()
+            nearest = int(np.argmin(np.linalg.norm(allv - point, axis=1)))
+            value = allv[nearest].tolist()
+            owners = np.concatenate([
+                np.full(p.mesh.n_points, i) for i, p in enumerate(self.parts)
+                if p.mesh is not None and p.mesh.n_points
+            ])
+            anchor_part = int(owners[nearest])
             refs = [(feats[0].feature_id, 0)]
         elif len(feats) >= 2:
             a, b = feats[0], feats[1]
@@ -7874,16 +10746,27 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 refs = [(a.feature_id, ia), (b.feature_id, ib)]
             elif kind == "concentric":
                 refs = [(a.feature_id, 0), (b.feature_id, 0)]
-            elif kind == "midpoint":
+            elif kind in ("midpoint", "on_curve"):
                 point, line = (a, b) if a.kind == "Point" else (b, a)
                 refs = [(point.feature_id, 0), (line.feature_id, None)]
+            elif kind == "symmetric":
+                centre = next((f for f in feats if f.kind == "Construction line"), None)
+                others = [f for f in feats if f is not centre][:2]
+                if centre is None or len(others) < 2:
+                    self.statusBar().showMessage("Symmetric needs two entities and a centerline.", 4000)
+                    return None
+                both_points = all(f.kind == "Point" for f in others)
+                refs = [(f.feature_id, 0 if both_points else None) for f in others] + [(centre.feature_id, None)]
+            elif kind == "on_edge":
+                self.statusBar().showMessage("Snap the point onto a model edge to attach it to the edge.", 4000)
+                return None
             else:
                 refs = [(a.feature_id, None), (b.feature_id, None)]
         else:
             self.statusBar().showMessage(f"'{kind}' needs two selected entities.", 4000)
             return None
         self._push_history(f"Add {kind} relation")
-        relation = Relation(kind, refs, value)
+        relation = Relation(kind, refs, value, part_index=anchor_part)
         manager.relations.append(relation)
         self._refresh_sketch_tree()
         self._refresh_scene(reset_camera=False)
@@ -8031,7 +10914,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if feat is None:
             return
         self._solve_sketches()
-        allowed, reason = can_assign_tool(feat)
+        allowed, reason = can_assign_tool(feat, self._sketch_problems_for(feat))
         if not allowed:
             self.terminal_core.log("warning", f"Tool not assigned: {reason}")
             QMessageBox.warning(self, "Cannot assign a tool", reason)
@@ -8173,6 +11056,18 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         display = renderer.GetDisplayPoint()
         return float(display[0]), float(display[1]), float(display[2])
 
+    def _project_world_points(self, points: np.ndarray) -> np.ndarray:
+        """Vectorised world -> display projection (same result as _project_world_point)."""
+        renderer = self.plotter.renderer
+        width, height = self.plotter.render_window.GetSize()
+        return project_points_to_display(
+            points,
+            renderer.GetActiveCamera(),
+            renderer.GetTiledAspectRatio(),
+            renderer.GetViewport(),
+            (width, height),
+        )
+
     def _select_box(self, start: QPoint, end: QPoint, additive: bool = False) -> None:
         scale = self.plotter.interactor.devicePixelRatioF()
         start_x = int(round(start.x() * scale))
@@ -8191,39 +11086,20 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         )
         selected_features = set(self.selected_features) if additive else set()
         for part_index, part in enumerate(self.parts):
-            matching: set[int] = set()
-            for cell_id in range(part.mesh.n_cells):
-                cell = part.mesh.get_cell(cell_id)
-                if cell.n_points == 0:
-                    continue
-                projected = [self._project_world_point(point) for point in cell.points]
-                screen = [(x, height - y, z) for x, y, z in projected]
-                xs = [point[0] for point in screen]
-                ys = [point[1] for point in screen]
-                fully_inside = all(
-                    left <= x <= right and top <= y <= bottom
-                    for x, y in zip(xs, ys)
-                )
-                intersects = (
-                    max(xs) >= left and min(xs) <= right
-                    and max(ys) >= top and min(ys) <= bottom
-                )
-                if (contained and not fully_inside) or (not contained and not intersects):
-                    continue
-                center_x = int(round(sum(xs) / len(xs)))
-                center_y = int(round(sum(ys) / len(ys)))
-                center_depth = sum(point[2] for point in screen) / len(screen)
-                if not through:
-                    visible_depth = self.plotter.renderer.GetZ(center_x, height - center_y)
-                    if visible_depth < 0 or center_depth > visible_depth + 0.015:
-                        continue
-                matching.add(cell_id)
-            if matching:
-                selected.setdefault(part_index, set()).update(matching)
+            hits = box_select_faces(
+                part.mesh,
+                self._project_world_points,
+                (left, right, top, bottom),
+                height,
+                contained,
+                None if through else self.plotter.renderer.GetZ,
+                width=self.plotter.render_window.GetSize()[0],
+            )
+            if hits:
                 feature_ids = part.mesh.cell_data.get("feature_id")
-                for cell_id in matching:
-                    feature_id = int(feature_ids[cell_id]) if feature_ids is not None else cell_id
-                    selected_features.add((part_index, feature_id))
+                for feature_id, cell_ids in hits.items():
+                    selected.setdefault(part_index, set()).update(cell_ids)
+                    selected_features.add((part_index, feature_id if feature_ids is not None else cell_ids[0]))
         self.selected_cells = selected
         self.selected_features = selected_features
         self.selected_feature = next(iter(selected_features)) if len(selected_features) == 1 else None

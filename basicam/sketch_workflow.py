@@ -63,8 +63,66 @@ class SnapSettings:
 @dataclass
 class SnapCandidate:
     point: np.ndarray
-    kind: str  # "Endpoint", "Midpoint", "Center", "Edge", "Coincident", "Tangent", "Horizontal", "Vertical"
+    # "Coincident", "Center", "Midpoint", "Tangent", "OnCurve", "ModelVertex", "ModelEdge", "Edge"
+    kind: str
     label: str = ""
+    entity_id: str = ""  # sketch entity snapped to
+    part_index: int | None = None  # model snaps: the part
+    segment: np.ndarray | None = None  # ModelEdge: the edge segment (2, 3) in world coordinates
+
+
+def _snap_points_of(feat) -> list[np.ndarray]:
+    """End and corner points a cursor can snap to (centres are separate)."""
+    pts = np.asarray(feat.points, dtype=float)
+    if len(pts) == 0:
+        return []
+    kind = feat.kind
+    control = getattr(feat, "control_points", None)
+    if kind == "Point" or len(pts) == 1:
+        return [pts[0]]
+    if kind == "Rectangle":
+        return [pts[i] for i in range(min(4, len(pts)))]
+    if kind == "Polygon" and control is not None:
+        return [np.asarray(c, dtype=float) for c in control[1:]]
+    if kind in ("Circle", "Slot"):
+        return []
+    return [pts[0], pts[-1]]
+
+
+def _centres_of(feat) -> list[np.ndarray]:
+    pts = np.asarray(feat.points, dtype=float)
+    control = getattr(feat, "control_points", None)
+    if feat.kind == "Circle" and len(pts) >= 4:
+        return [pts[:-1].mean(axis=0)]
+    if feat.kind == "Polygon" and control is not None:
+        return [np.asarray(control[0], dtype=float)]
+    if feat.kind == "Slot" and control is not None:
+        return [np.asarray(control[0], dtype=float), np.asarray(control[1], dtype=float)]
+    if feat.kind == "Curve" and len(pts) >= 3:
+        a, m, b = pts[0], pts[len(pts) // 2], pts[-1]
+        ab, ac = m - a, b - a
+        normal = np.cross(ab, ac)
+        denom = 2.0 * float(np.dot(normal, normal))
+        if denom < 1e-18:
+            return []
+        centre = a + (np.cross(normal, ab) * float(np.dot(ac, ac)) + np.cross(ac, normal) * float(np.dot(ab, ab))) / denom
+        return [centre]
+    return []
+
+
+def _closest_on_segments(point: np.ndarray, segments: np.ndarray):
+    """(closest point, its segment) on segments (M, 2, 3), or None."""
+    segments = np.asarray(segments, dtype=float).reshape(-1, 2, 3)
+    if len(segments) == 0:
+        return None
+    a, b = segments[:, 0], segments[:, 1]
+    ab = b - a
+    lengths = np.einsum("ij,ij->i", ab, ab)
+    t = np.where(lengths > 1e-18, np.einsum("ij,ij->i", np.asarray(point) - a, ab) / np.where(lengths > 1e-18, lengths, 1.0), 0.0)
+    t = np.clip(t, 0.0, 1.0)
+    feet = a + ab * t[:, None]
+    index = int(np.argmin(np.linalg.norm(feet - point, axis=1)))
+    return feet[index], segments[index]
 
 
 @dataclass
@@ -73,7 +131,11 @@ class SketchDimension:
 
     dim_id: str
     name: str
-    kind: str  # "X", "Y", "Z", "Length", "Offset", "Diameter", "Width", "Height"
+    # "X", "Y", "Z" (from the origin), "Length", "Offset", "Diameter", "Width", "Height",
+    # "Distance" (two entities), "Angle" (two lines, degrees), "Radius" (circle/arc),
+    # "PointLine" (point to line, perpendicular), "HDistance" / "VDistance" (two points along the
+    # sketch u / v axis). target_ids name the entities; point_refs the point index on each target.
+    kind: str
     value: float
     tolerance: float = 0.0
     valid: bool = True
@@ -82,6 +144,8 @@ class SketchDimension:
     driving: bool = True  # driving dimensions set geometry; driven ones only report it
     unit_text: str = "mm"  # unit the user typed (for display)
     sig_figs: int = 4  # significant figures of the typed value
+    point_refs: list[int] = field(default_factory=list)  # point index per target id (default 0)
+    label_offset: list[float] = field(default_factory=list)  # (u, v) of the label from its anchor
 
 
 @dataclass
@@ -110,6 +174,9 @@ class ParametricSketchFeature:
     state: str = "underdefined"  # "defined", "underdefined" or "error" (set by the solver)
     broken_reason: str = ""  # set when a referenced entity was deleted
     status: str = ""  # "future" = Future operation (no tool needed yet)
+    # Defining points of composite entities (world xyz): Slot = [centre 1, centre 2, arc 1 start];
+    # Polygon = [centre, vertex 0, ..., vertex n-1]. `points` stays the drawn outline.
+    control_points: np.ndarray | None = None
 
     @property
     def entity_id(self) -> str:
@@ -315,6 +382,50 @@ def sample_rectangle_points(p1: np.ndarray, p2: np.ndarray, plane: SketchPlane, 
         plane.uv_to_world(umin, vmin),
     ]
     return np.asarray(corners, dtype=float)
+
+
+def slot_outline_uv(c1, c2, a1s, segments: int = 16) -> tuple[list, list]:
+    """Slot from its two arc centres and arc 1's start point (all uv).
+
+    Returns (solver points [c1, c2, a1s, a1e, a2s, a2e], closed outline uv). Arc 1 runs CCW from
+    a1s = c1 + n*r to a1e = c1 - n*r around the far end of c1; arc 2 from c2 - n*r to c2 + n*r.
+    """
+    c1, c2, a1s = (np.asarray(p, dtype=float)[:2] for p in (c1, c2, a1s))
+    d = c2 - c1
+    length = float(np.linalg.norm(d))
+    d = d / length if length > 1e-12 else np.array([1.0, 0.0])
+    n = np.array([-d[1], d[0]])
+    r = max(float(np.linalg.norm(a1s - c1)), 1e-6)
+    pts = [c1, c2, c1 + n * r, c1 - n * r, c2 - n * r, c2 + n * r]
+    a_n = math.atan2(n[1], n[0])
+    outline = [c1 + r * np.array([math.cos(a), math.sin(a)]) for a in np.linspace(a_n, a_n + math.pi, segments + 1)]
+    outline += [c2 + r * np.array([math.cos(a), math.sin(a)]) for a in np.linspace(a_n + math.pi, a_n + 2 * math.pi, segments + 1)]
+    outline.append(outline[0])
+    return [tuple(p) for p in pts], [tuple(p) for p in outline]
+
+
+def sample_slot(c1: np.ndarray, c2: np.ndarray, width: float, plane: SketchPlane) -> tuple[np.ndarray, np.ndarray]:
+    """(control_points, outline) of a straight slot with arc centres c1, c2 and the given width."""
+    u1, u2 = np.asarray(plane.world_to_uv(c1)), np.asarray(plane.world_to_uv(c2))
+    d = u2 - u1
+    length = float(np.linalg.norm(d))
+    d = d / length if length > 1e-12 else np.array([1.0, 0.0])
+    a1s = u1 + np.array([-d[1], d[0]]) * (width / 2.0)
+    pts, outline = slot_outline_uv(u1, u2, a1s)
+    control = np.asarray([plane.uv_to_world(*pts[i]) for i in (0, 1, 2)], dtype=float)
+    return control, np.asarray([plane.uv_to_world(u, v) for u, v in outline], dtype=float)
+
+
+def sample_polygon(centre: np.ndarray, vertex: np.ndarray, sides: int, plane: SketchPlane) -> tuple[np.ndarray, np.ndarray]:
+    """(control_points [centre, vertices...], closed outline) of a regular polygon (inscribed)."""
+    sides = max(3, int(sides))
+    cu, cv = plane.world_to_uv(centre)
+    vu, vv = plane.world_to_uv(vertex)
+    r = math.hypot(vu - cu, vv - cv) or 1.0
+    a0 = math.atan2(vv - cv, vu - cu)
+    verts = [plane.uv_to_world(cu + r * math.cos(a0 + 2 * math.pi * i / sides), cv + r * math.sin(a0 + 2 * math.pi * i / sides)) for i in range(sides)]
+    control = np.asarray([plane.uv_to_world(cu, cv)] + verts, dtype=float)
+    return control, np.asarray(verts + [verts[0]], dtype=float)
 
 
 def sample_circle_points(center: np.ndarray, edge_pt: np.ndarray, plane: SketchPlane, segments: int = 48) -> np.ndarray:
@@ -612,108 +723,124 @@ class SketchWorkflowManager:
         *,
         anchor_point: np.ndarray | None = None,
         part_meshes: Iterable[pv.PolyData] = (),
+        tolerance: float | None = None,
+        model_vertices: Iterable[tuple[int, np.ndarray]] = (),
+        model_edges: Iterable[tuple[int, np.ndarray]] = (),
+        exclude_ids: Iterable[str] = (),
     ) -> tuple[np.ndarray, SnapCandidate | None, list[str]]:
-        """Resolves active snap targets and geometric constraints (H/V/Coincident/Center/Edge/Tangent)."""
+        """Snap a cursor point (sketch-engine.spec B5).
+
+        Priority, nearest within ``tolerance`` (mm; the window passes its pixel radius converted
+        at the cursor) inside each group: sketch points and centres > model vertices > midpoints
+        > tangent points > model edges and sketch curves. Then horizontal / vertical inference
+        from ``anchor_point``. ``model_vertices`` / ``model_edges`` are (part index, points) and
+        (part index, segments of shape (M, 2, 3)) in the part's current position. A model vertex
+        keeps its own 3D coordinates (the point is defined there).
+        """
         pt = np.asarray(raw_point, dtype=float)
-        if self.active_plane is not None:
-            pt = self.active_plane.project_point_to_plane(pt)
+        plane = self.active_plane
+        if plane is not None:
+            pt = plane.project_point_to_plane(pt)
 
-        tol = max(float(self.snap_settings.snap_radius_mm), 0.05)
-        best: SnapCandidate | None = None
-        best_dist = tol
-        applied_constraints: list[str] = []
+        def project(p):
+            return plane.project_point_to_plane(p) if plane is not None else np.asarray(p, dtype=float)
 
-        # 1. Snap to existing sketch endpoints, midpoints, circle centers, and edges
+        tol = max(float(tolerance if tolerance is not None else self.snap_settings.snap_radius_mm), 1e-4)
+        settings = self.snap_settings
+        excluded = set(exclude_ids)
+        model_vertices = list(model_vertices)
+        groups: dict[int, tuple[float, SnapCandidate]] = {}
+
+        def offer(priority: int, point, candidate: SnapCandidate, *, on_plane: bool = True) -> None:
+            point = project(point) if on_plane else np.asarray(point, dtype=float)
+            distance = float(np.linalg.norm(project(point) - pt))
+            if distance <= tol and (priority not in groups or distance < groups[priority][0]):
+                candidate.point = point
+                groups[priority] = (distance, candidate)
+
         for feat in self.features:
+            if feat.feature_id in excluded:
+                continue
             fpts = np.asarray(feat.points, dtype=float)
             if len(fpts) == 0:
                 continue
-            if self.snap_settings.endpoints or self.snap_settings.coincident:
-                for ep in fpts:
-                    proj_ep = self.active_plane.project_point_to_plane(ep) if self.active_plane else ep
-                    d = float(np.linalg.norm(pt - proj_ep))
-                    if d < best_dist:
-                        best_dist = d
-                        best = SnapCandidate(proj_ep, "Coincident", f"Coincident ({feat.name})")
-
-            if self.snap_settings.centers and feat.kind in {"Circle", "Rectangle"} and len(fpts) >= 3:
-                center = fpts[:-1].mean(axis=0)
-                if self.active_plane:
-                    center = self.active_plane.project_point_to_plane(center)
-                d = float(np.linalg.norm(pt - center))
-                if d < best_dist:
-                    best_dist = d
-                    best = SnapCandidate(center, "Center", f"Center ({feat.name})")
-
-            if self.snap_settings.midpoints and len(fpts) >= 2:
+            closed = feat.kind in {"Circle", "Rectangle", "Slot", "Polygon"}
+            if settings.endpoints or settings.coincident:
+                for ep in _snap_points_of(feat):
+                    offer(0, ep, SnapCandidate(ep, "Coincident", f"Coincident ({feat.name})", feat.feature_id))
+            if settings.centers:
+                for center in _centres_of(feat):
+                    offer(0, center, SnapCandidate(center, "Center", f"Center ({feat.name})", feat.feature_id))
+            if settings.midpoints and len(fpts) >= 2 and feat.kind in {"Line", "Construction line", "Rectangle", "Polygon"}:
                 for i in range(len(fpts) - 1):
                     mid = 0.5 * (fpts[i] + fpts[i + 1])
-                    if self.active_plane:
-                        mid = self.active_plane.project_point_to_plane(mid)
-                    d = float(np.linalg.norm(pt - mid))
-                    if d < best_dist:
-                        best_dist = d
-                        best = SnapCandidate(mid, "Midpoint", f"Midpoint ({feat.name})")
-
-            if self.snap_settings.tangent and feat.kind == "Circle" and anchor_point is not None and len(fpts) >= 3:
+                    offer(2, mid, SnapCandidate(mid, "Midpoint", f"Midpoint ({feat.name})", feat.feature_id))
+            if settings.tangent and feat.kind == "Circle" and anchor_point is not None and len(fpts) >= 3 and plane is not None:
                 center = fpts[:-1].mean(axis=0)
                 radius = float(np.linalg.norm(fpts[0] - center))
-                to_anchor = anchor_point - center
-                dist_ac = float(np.linalg.norm(to_anchor))
-                if dist_ac > radius + 1e-4 and self.active_plane is not None:
-                    ua, va = self.active_plane.world_to_uv(anchor_point)
-                    uc, vc = self.active_plane.world_to_uv(center)
+                dist_ac = float(np.linalg.norm(anchor_point - center))
+                if dist_ac > radius + 1e-4:
+                    ua, va = plane.world_to_uv(anchor_point)
+                    uc, vc = plane.world_to_uv(center)
                     base_ang = math.atan2(va - vc, ua - uc)
                     alpha = math.acos(min(max(radius / dist_ac, -1.0), 1.0))
                     for sign in (-1.0, 1.0):
-                        t_pt = self.active_plane.uv_to_world(
-                            uc + radius * math.cos(base_ang + sign * alpha),
-                            vc + radius * math.sin(base_ang + sign * alpha),
+                        t_pt = plane.uv_to_world(
+                            uc + radius * math.cos(base_ang + sign * alpha), vc + radius * math.sin(base_ang + sign * alpha)
                         )
-                        d = float(np.linalg.norm(pt - t_pt))
-                        if d < best_dist:
-                            best_dist = d
-                            best = SnapCandidate(t_pt, "Tangent", f"Tangent ({feat.name})")
+                        offer(3, t_pt, SnapCandidate(t_pt, "Tangent", f"Tangent ({feat.name})", feat.feature_id))
+            if settings.edges and len(fpts) >= 2 and feat.kind != "Point":
+                segments = np.stack((fpts[:-1], fpts[1:]), axis=1)
+                if closed and not np.allclose(fpts[0], fpts[-1]):
+                    segments = np.vstack((segments, [[fpts[-1], fpts[0]]]))
+                hit = _closest_on_segments(pt, segments)
+                if hit is not None:
+                    offer(4, hit[0], SnapCandidate(hit[0], "OnCurve", f"On {feat.name}", feat.feature_id))
 
-        # 2. Snap to part vertices, edge midpoints, and round-feature arc centers
-        if best is None and (self.snap_settings.edges or self.snap_settings.centers):
+        if settings.edges or settings.endpoints:
+            for part_index, verts in model_vertices:
+                verts = np.asarray(verts, dtype=float).reshape(-1, 3)
+                if len(verts) == 0:
+                    continue
+                flat = np.asarray([project(v) for v in verts]) if plane is not None else verts
+                along = np.linalg.norm(flat - pt, axis=1)
+                off_plane = np.linalg.norm(verts - flat, axis=1)
+                # Vertices that line up on screen (top and bottom corner): prefer the one on the plane.
+                nearest = int(np.lexsort((off_plane, np.round(along, 6)))[0])
+                vertex = verts[nearest]
+                offer(1, vertex, SnapCandidate(vertex, "ModelVertex", "Model vertex", "", part_index), on_plane=False)
+        if settings.edges:
+            for part_index, segments in model_edges:
+                segments = np.asarray(segments, dtype=float).reshape(-1, 2, 3)
+                hit = _closest_on_segments(pt, segments)
+                if hit is not None:
+                    point, segment = hit
+                    offer(4, point, SnapCandidate(point, "ModelEdge", "Model edge", "", part_index, segment))
+        # Older callers: plain part meshes (vertex snap only).
+        if not groups and not model_vertices and (settings.edges or settings.centers):
             for mesh in part_meshes:
                 if mesh is None or mesh.n_points == 0:
                     continue
                 cid = mesh.find_closest_point(pt)
                 if cid >= 0:
                     v_pt = np.asarray(mesh.points[cid], dtype=float)
-                    if self.active_plane:
-                        v_pt = self.active_plane.project_point_to_plane(v_pt)
-                    d = float(np.linalg.norm(pt - v_pt))
-                    if d < best_dist:
-                        best_dist = d
-                        best = SnapCandidate(v_pt, "Edge", "Part vertex/edge")
+                    offer(1, v_pt, SnapCandidate(v_pt, "Edge", "Part vertex/edge"))
 
-            # Detect circular boundary loop center on active surface mesh
-            if best is None and self.snap_settings.centers and self.active_plane and self.active_plane.surface_mesh is not None:
-                surf = self.active_plane.surface_mesh
-                if surf.n_points >= 6:
-                    c_pt = self.active_plane.project_point_to_plane(np.asarray(surf.points).mean(axis=0))
-                    d = float(np.linalg.norm(pt - c_pt))
-                    if d < best_dist * 1.4:
-                        best = SnapCandidate(c_pt, "Center", "Surface centerpoint")
-
+        best: SnapCandidate | None = groups[min(groups)][1] if groups else None
+        applied_constraints: list[str] = []
         if best is not None:
-            pt = best.point.copy()
+            pt = np.asarray(best.point, dtype=float).copy()
             applied_constraints.append(best.kind)
 
-        # 3. Horizontal / Vertical alignment relative to anchor_point on active plane
-        if anchor_point is not None and self.active_plane is not None:
-            u0, v0 = self.active_plane.world_to_uv(anchor_point)
-            u1, v1 = self.active_plane.world_to_uv(pt)
-            if self.snap_settings.horizontal and abs(v1 - v0) < tol * 0.75 and abs(u1 - u0) > tol:
-                v1 = v0
-                pt = self.active_plane.uv_to_world(u1, v1)
+        # Horizontal / vertical alignment relative to anchor_point (free cursor only).
+        if anchor_point is not None and plane is not None and best is None:
+            u0, v0 = plane.world_to_uv(anchor_point)
+            u1, v1 = plane.world_to_uv(pt)
+            if settings.horizontal and abs(v1 - v0) < tol * 0.75 and abs(u1 - u0) > tol:
+                pt = plane.uv_to_world(u1, v0)
                 applied_constraints.append("Horizontal")
-            elif self.snap_settings.vertical and abs(u1 - u0) < tol * 0.75 and abs(v1 - v0) > tol:
-                u1 = u0
-                pt = self.active_plane.uv_to_world(u1, v1)
+            elif settings.vertical and abs(u1 - u0) < tol * 0.75 and abs(v1 - v0) > tol:
+                pt = plane.uv_to_world(u0, v1)
                 applied_constraints.append("Vertical")
 
         return pt, best, applied_constraints
@@ -729,6 +856,7 @@ class SketchWorkflowManager:
         auto_dimension: bool = False,
         constraints: list[str] | None = None,
         variant: str = "",
+        control_points: np.ndarray | None = None,
     ) -> ParametricSketchFeature:
         self.save_snapshot()
         number = self._next_number()
@@ -745,6 +873,7 @@ class SketchWorkflowManager:
             constraints=list(constraints or []),
             owner_sketch_id=self.active_owner or "",
             variant=variant,
+            control_points=None if control_points is None else np.asarray(control_points, dtype=float).reshape(-1, 3),
         )
         # Auto-project onto curved surface when active_plane is a curved manifold region
         if (
@@ -946,7 +1075,7 @@ class SketchWorkflowManager:
                 feat.has_error = True
                 feat.error_message = f"{dim.name}: invalid value"
                 return
-            if dim.kind in {"Length", "Diameter", "Width", "Height"} and dim.value <= 0.0:
+            if dim.kind in {"Length", "Diameter", "Width", "Height", "Radius"} and dim.value <= 0.0:
                 dim.valid = False
                 dim.error_message = f"{dim.kind} must be > 0"
                 feat.has_error = True

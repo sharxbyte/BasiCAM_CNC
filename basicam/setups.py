@@ -21,3 +21,9 @@ class MachiningSetup:
     safe_z_mm: float = 5.0  # rapid height above the stock top
     retract_clearance_mm: float = 2.0  # retract height above the stock top between passes
     stock_clearance_mm: float = 1.0  # extra margin around the part/stock for toolpaths
+    work_type: str = ""  # "flat", "round" or "surface" (v2 Block 15); "" = not asked yet
+    work_surface: dict | None = None  # surface jobs: {"part": index, "features": [...]}
+    rotary_index_deg: float = 0.0  # indexed 4th axis (v2 Block 17)
+    tool_orientation: tuple[float, float, float] | None = None  # 3+2: tool axis (face normal) in work coordinates
+    rotary_angles: dict | None = None  # resolved A/B/C for tool_orientation
+    turning: dict | None = None  # turning setup (v2 Block 20): stock, axis, eccentric offset, jaws

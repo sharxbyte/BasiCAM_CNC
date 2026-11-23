@@ -174,6 +174,8 @@ class ToolpathDynamicsEngine:
         bounds_xy: tuple[float, float, float, float] = (-40.0, 40.0, -40.0, 40.0),
         path_xy: list[tuple[float, float]] | None = None,
         surface_passes: list[list[tuple[float, float, float]]] | None = None,
+        contour_paths: list[list[tuple[float, float]]] | None = None,
+        drill_points: list[tuple[float, float]] | None = None,
     ) -> list[ToolpathSegment]:
         """Segments for one operation.
 
@@ -206,14 +208,68 @@ class ToolpathDynamicsEngine:
         if surface_passes:
             first = surface_passes[0][0]
             add("rapid", (first[0], first[1], safe_z), (first[0], first[1], safe_z), rapid_feed, pass_=0)
+            far = 2.0 * max(float(operation.tool_diameter_mm), 1.0)
+            previous_end = None
             for index, line in enumerate(surface_passes, start=1):
                 start = line[0]
-                add("rapid", (start[0], start[1], safe_z if index == 1 else retract_z), (start[0], start[1], retract_z), rapid_feed, pass_=index)
+                if previous_end is not None and math.dist(previous_end[:2], start[:2]) > far:
+                    # separate region: over the top at safe Z, not dragging at the retract height
+                    add("rapid", (previous_end[0], previous_end[1], retract_z), (previous_end[0], previous_end[1], safe_z), rapid_feed, pass_=index)
+                    add("rapid", (previous_end[0], previous_end[1], safe_z), (start[0], start[1], safe_z), rapid_feed, pass_=index)
+                    add("rapid", (start[0], start[1], safe_z), (start[0], start[1], retract_z), rapid_feed, pass_=index)
+                else:
+                    add("rapid", (start[0], start[1], safe_z if index == 1 else retract_z), (start[0], start[1], retract_z), rapid_feed, pass_=index)
+                previous_end = line[-1]
                 add("plunge", (start[0], start[1], retract_z), start, plunge_feed, pass_=index)
                 for a, b in zip(line[:-1], line[1:]):
                     add("cut", a, b, cut_feed, pass_=index, surface=True)
                 add("retract", line[-1], (line[-1][0], line[-1][1], retract_z), rapid_feed, pass_=index)
             last = surface_passes[-1][-1]
+            add("rapid", (last[0], last[1], retract_z), (last[0], last[1], safe_z), rapid_feed, final=True)
+            return segments
+
+        if drill_points:
+            depth = abs(float(operation.depth_mm))
+            peck = max(0.0, float(getattr(operation, "peck_mm", 0.0) or 0.0))
+            for index, (x, y) in enumerate(drill_points, start=1):
+                x, y = float(x) + ox, float(y) + oy
+                add("rapid", (x, y, safe_z), (x, y, retract_z), rapid_feed, pass_=index, hole=index)
+                reached = 0.0
+                # G83-style pecks expanded to G0/G1 (GRBL has no canned cycles)
+                while reached < depth - 1e-9:
+                    target = min(depth, reached + peck) if peck > 0 else depth
+                    start_z = top - max(0.0, reached - 0.5) if reached > 0 else retract_z
+                    if reached > 0:
+                        add("rapid", (x, y, retract_z), (x, y, start_z), rapid_feed, pass_=index, hole=index)
+                    add("plunge", (x, y, start_z), (x, y, top - target), plunge_feed, pass_=index, hole=index)
+                    add("retract", (x, y, top - target), (x, y, retract_z), rapid_feed, pass_=index, hole=index)
+                    reached = target
+                add("rapid", (x, y, retract_z), (x, y, safe_z), rapid_feed, pass_=index, hole=index)
+            if segments:
+                segments[-1].metadata["final"] = True
+            return segments
+
+        if contour_paths:
+            depths = pass_depths(
+                operation.depth_mm, operation.stepdown_mm,
+                getattr(operation, "first_pass_count", 0), getattr(operation, "first_pass_depth_mm", 0.5),
+                getattr(operation, "final_pass_depth_mm", 0.0),
+            )
+            paths = [[(float(x) + ox, float(y) + oy) for x, y in path] for path in contour_paths if len(path) >= 2]
+            if not paths:
+                return segments
+            add("rapid", (paths[0][0][0], paths[0][0][1], safe_z), (paths[0][0][0], paths[0][0][1], safe_z), rapid_feed, pass_=0)
+            for pass_idx, depth in enumerate(depths, start=1):
+                z_pass = top - depth
+                for ring_index, path in enumerate(paths):
+                    start = path[0]
+                    add("rapid", (start[0], start[1], retract_z), (start[0], start[1], retract_z), rapid_feed, pass_=pass_idx)
+                    add("plunge", (start[0], start[1], retract_z), (start[0], start[1], z_pass), plunge_feed, pass_=pass_idx)
+                    for a, b in zip(path[:-1], path[1:]):
+                        add("cut", (a[0], a[1], z_pass), (b[0], b[1], z_pass), cut_feed, pass_=pass_idx, ring=ring_index)
+                    end = path[-1]
+                    add("retract", (end[0], end[1], z_pass), (end[0], end[1], retract_z), rapid_feed, pass_=pass_idx)
+            last = paths[-1][-1]
             add("rapid", (last[0], last[1], retract_z), (last[0], last[1], safe_z), rapid_feed, final=True)
             return segments
 
@@ -408,7 +464,11 @@ class PostProcessorCompiler:
         manual_spindle: bool = False,
         coolant: bool = False,
         work_offset: str = "G54",
+        tool_change_lines=None,
+        op_start_lines=None,
+        op_end_lines=None,
     ) -> str:
+        """``tool_change_lines(tool_name, first)``: G-code for a change to that tool (Block 11)."""
         """Segments are millimetres; under G20 every coordinate and feed is converted to inches."""
         inches = str(units_code).upper() == "G20"
         scale = 1.0 / 25.4 if inches else 1.0
@@ -423,27 +483,75 @@ class PostProcessorCompiler:
 
         active_rpm: int | None = None
         active_op: str | None = None
+        active_rotary: dict = {}
+        inverse_time = False
+        active_tool: str | None = None
+        pending_start: list[str] = []
         if coolant and self.spec.coolant_command:
             lines.append(self.spec.coolant_command)
 
         for seg in segments:
             op_name = seg.metadata.get("op") if seg.metadata else None
             if op_name and op_name != active_op:
+                if active_op is not None and op_end_lines is not None:
+                    lines.extend(op_end_lines(active_op) or [])
                 tool = seg.metadata.get("tool", "")
+                if tool_change_lines is not None and tool and tool != active_tool:
+                    block = tool_change_lines(tool, active_tool is None) or []
+                    lines.extend(block)
+                    if block:
+                        active_rpm = None  # the spindle restarts after a change
+                    active_tool = tool
                 lines.append(f"; Operation: {op_name}" + (f" · Tool: {tool}" if tool else ""))
+                if op_start_lines is not None:
+                    pending_start = list(op_start_lines(op_name) or [])
+                else:
+                    pending_start = []
                 active_op = op_name
             if not manual_spindle and seg.rpm > 0 and seg.rpm != active_rpm:
                 lines.append(f"{self.spec.spindle_cw_command} S{int(seg.rpm)}")
                 active_rpm = int(seg.rpm)
+            if pending_start:  # auxiliaries on once the spindle is running, before the first move
+                lines.extend(pending_start)
+                pending_start = []
 
+            meta_lines = seg.metadata or {}
+            if meta_lines.get("beam_on"):  # laser / plasma / waterjet on (process post, Block 13)
+                lines.extend(str(l) for l in meta_lines["beam_on"])
+            if float(meta_lines.get("dwell_s", 0.0) or 0.0) > 0:
+                lines.append(f"G4 P{float(meta_lines['dwell_s']):.2f}")
             x, y, z = (v * scale for v in seg.end)
             gcode_cmd = "G0" if seg.kind in ("rapid", "retract") else "G1"
             feed = float(seg.feed_mm_min) * scale
+            rotary = dict((seg.metadata or {}).get("rotary") or {})
+            words = "".join(f" {name}{float(value):.3f}" for name, value in sorted(rotary.items()))
+            turned = any(abs(float(rotary[n]) - float(active_rotary.get(n, rotary[n]))) > 1e-9 for n in rotary)
             if gcode_cmd == "G0":
-                lines.append(f"G0 X{x:.{digits}f} Y{y:.{digits}f} Z{z:.{digits}f}")
+                lines.append(f"G0 X{x:.{digits}f} Y{y:.{digits}f} Z{z:.{digits}f}{words}")
+            elif turned:
+                # moves that turn a rotary axis use inverse-time feed: F = 1 / minutes for the move
+                if not inverse_time:
+                    lines.append("G93")
+                    inverse_time = True
+                length = math.dist(seg.start, seg.end)
+                minutes = max(length / max(float(seg.feed_mm_min), 1e-6), 1e-4)
+                arc = float((seg.metadata or {}).get("surface_mm", 0.0) or 0.0)
+                if arc > 0:  # wrapped / rotary: the surface distance sets the time
+                    minutes = max(math.hypot(length, arc) / max(float(seg.feed_mm_min), 1e-6), 1e-4)
+                lines.append(f"G1 X{x:.{digits}f} Y{y:.{digits}f} Z{z:.{digits}f}{words} F{1.0 / minutes:.4f}")
             else:
-                lines.append(f"G1 X{x:.{digits}f} Y{y:.{digits}f} Z{z:.{digits}f} F{feed:.{2 if inches else 1}f}")
+                if inverse_time:
+                    lines.append("G94")
+                    inverse_time = False
+                lines.append(f"G1 X{x:.{digits}f} Y{y:.{digits}f} Z{z:.{digits}f}{words} F{feed:.{2 if inches else 1}f}")
+            active_rotary.update(rotary)
+            if meta_lines.get("beam_off"):
+                lines.extend(str(l) for l in meta_lines["beam_off"])
 
+        if inverse_time:
+            lines.append("G94")
+        if active_op is not None and op_end_lines is not None:
+            lines.extend(op_end_lines(active_op) or [])
         for ftr in self.spec.program_footer:
             lines.append(self._scale_words(ftr, scale, digits) if inches else ftr)
 

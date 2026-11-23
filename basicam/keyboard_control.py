@@ -40,6 +40,7 @@ STEPS_IN = {"medium": 0.1, "fine": 0.01, "large": 1.0}
 DIRECT = {
     "Left": ("X", -1), "Right": ("X", 1), "Up": ("Y", 1), "Down": ("Y", -1),
     "PageUp": ("Z", 1), "PageDown": ("Z", -1),
+    "[": ("A", -1), "]": ("A", 1),  # rotary axis (degrees): the machine's rotary letter is used
 }
 
 
@@ -158,4 +159,5 @@ QT_KEY_NAMES = {
     "Key_PageUp": "PageUp", "Key_PageDown": "PageDown", "Key_Home": "Home", "Key_End": "End",
     "Key_Escape": "Escape", "Key_Return": "Enter", "Key_Enter": "Enter", "Key_Backspace": "Backspace",
     "Key_Plus": "+", "Key_Minus": "-", "Key_Period": ".",
+    "Key_BracketLeft": "[", "Key_BracketRight": "]",
 }

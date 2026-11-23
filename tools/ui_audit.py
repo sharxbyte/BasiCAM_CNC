@@ -169,10 +169,12 @@ def fire_checks(window) -> list[tuple[str, str]]:
         mock.patch.object(QDialog, "exec", return_value=0),
         mock.patch.object(QMenu, "exec", return_value=None),
         mock.patch.object(QFileDialog, "getOpenFileName", return_value=("", "")),
+        mock.patch.object(QFileDialog, "getOpenFileNames", return_value=([], "")),
         mock.patch.object(QFileDialog, "getSaveFileName", return_value=("", "")),
         mock.patch.object(QFileDialog, "getExistingDirectory", return_value=""),
         mock.patch.object(QInputDialog, "getText", return_value=("", False)),
         mock.patch.object(QInputDialog, "getDouble", return_value=(0.0, False)),
+        mock.patch.object(QInputDialog, "getInt", return_value=(0, False)),
         mock.patch.object(QInputDialog, "getItem", return_value=("", False)),
         mock.patch("PySide6.QtGui.QDesktopServices.openUrl", return_value=True),
     ]

@@ -34,18 +34,25 @@ from basicam.tooling import (
 
 
 class ToolLibraryDialog(QDialog):
-    def __init__(self, tools: list[ToolDefinition], parent=None, machine_store=None) -> None:
+    def __init__(self, tools: list[ToolDefinition], parent=None, machine_store=None, material_store=None, picker: bool = False) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Tool inventory")
+        self.picker = picker  # Assign tool: pick a tool, OK / Cancel
+        self.setWindowTitle("Pick a tool" if picker else "Tool inventory")
         self.resize(1120, 720)
         self.tools = deepcopy(tools)
         self.selected_index = -1
         self.machine_store = machine_store
+        self.material_store = material_store
         self.machines_tab = None
+        self.materials_tab = None
         self._build_ui()
         self._refresh_list()
-        if self.tools:
+        if self.tools and not picker:
             self.inventory.setCurrentRow(0)
+        if picker:  # nothing chosen yet: OK stays disabled until a tool is clicked
+            self.inventory.setCurrentRow(-1)
+            self.selected_index = -1
+            self.ok_button.setEnabled(False)
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -57,6 +64,11 @@ class ToolLibraryDialog(QDialog):
             self.tabs.addTab(splitter, "Tools")
             self.machines_tab = MachinesTab(self.machine_store)
             self.tabs.addTab(self.machines_tab, "Machines")
+            if self.material_store is not None:
+                from basicam.part_materials_dialog import MaterialsTab
+
+                self.materials_tab = MaterialsTab(self.material_store)
+                self.tabs.addTab(self.materials_tab, "Materials")
             root.addWidget(self.tabs, 1)
         else:
             root.addWidget(splitter, 1)
@@ -191,10 +203,19 @@ class ToolLibraryDialog(QDialog):
         note.setWordWrap(True)
         note.setToolTip("The 3D view renders the revolved outer envelope, not helical flutes or chip load")
         footer.addWidget(note, 1)
-        close_button = QPushButton("Done")
-        close_button.setToolTip("Close the tool inventory dialog")
-        close_button.clicked.connect(self.accept)
-        footer.addWidget(close_button)
+        if self.picker:
+            self.ok_button = QPushButton("OK")
+            self.ok_button.setEnabled(False)  # until a tool is selected
+            self.ok_button.clicked.connect(self.accept)
+            cancel = QPushButton("Cancel")
+            cancel.clicked.connect(self.reject)
+            footer.addWidget(self.ok_button)
+            footer.addWidget(cancel)
+        else:
+            close_button = QPushButton("Done")
+            close_button.setToolTip("Close the tool inventory dialog")
+            close_button.clicked.connect(self.accept)
+            footer.addWidget(close_button)
         root.addLayout(footer)
 
         # Live preview: any edit refreshes the 3D cutter after a short pause.
@@ -218,7 +239,12 @@ class ToolLibraryDialog(QDialog):
             self.selected_index = min(max(current, 0), len(self.tools) - 1)
             self.inventory.setCurrentRow(self.selected_index)
 
+    def selected_tool(self) -> ToolDefinition | None:
+        return self.tools[self.selected_index] if 0 <= self.selected_index < len(self.tools) else None
+
     def _select_tool(self, index: int) -> None:
+        if getattr(self, "ok_button", None) is not None:
+            self.ok_button.setEnabled(0 <= index < len(self.tools))
         if not 0 <= index < len(self.tools):
             return
         self.selected_index = index

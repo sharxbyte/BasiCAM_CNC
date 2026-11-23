@@ -30,6 +30,7 @@ class ImportedGeometry:
     solid_conversion_message: str = ""
     native_brep: bool = False
     unsupported: list[str] | None = None  # drawing entity types that were not imported
+    placement_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)  # translation applied by place_at_origin
 
     @property
     def geometry_type(self) -> str:
@@ -64,7 +65,7 @@ def load_part_geometry(path: str | Path, millimeters_per_unit: float) -> Importe
             (np.full(len(imported.faces), 3, dtype=np.int64), imported.faces)
         ).ravel()
         part = pv.PolyData(imported.vertices, faces)
-        part.cell_data["feature_id"] = np.arange(len(imported.faces), dtype=np.int64)
+        part.cell_data["feature_id"] = group_planar_facets(imported)
         solid_shape, solid_conversion_message = _mesh_to_solid(imported)
         brep_shape = solid_shape
     elif suffix == ".dxf":
@@ -270,6 +271,116 @@ def _load_open_cascade(path: Path) -> tuple[pv.PolyData, object, pv.PolyData]:
     part.cell_data["feature_id"] = np.asarray(feature_ids, dtype=np.int64)
     edge_mesh = pv.PolyData(np.asarray(edge_points), lines=np.asarray(edge_lines, dtype=np.int64))
     return part, shape, edge_mesh
+
+
+def group_planar_facets(mesh: trimesh.Trimesh, angle_deg: float = 1.0) -> np.ndarray:
+    """One face id per triangle: edge-connected triangles whose normals stay within
+    ``angle_deg`` of the group's first triangle form one planar face. Curved areas
+    therefore stay small groups (the seed normal stops the drift)."""
+    count = len(mesh.faces)
+    labels = np.full(count, -1, dtype=np.int64)
+    if count == 0:
+        return labels
+    normals = np.asarray(mesh.face_normals, dtype=float)
+    limit = float(np.cos(np.radians(angle_deg)))
+    pairs = np.asarray(mesh.face_adjacency, dtype=np.int64).reshape(-1, 2)
+    if len(pairs):
+        dots = np.einsum("ij,ij->i", normals[pairs[:, 0]], normals[pairs[:, 1]])
+        pairs = pairs[dots >= limit]
+    neighbours: list[list[int]] = [[] for _ in range(count)]
+    for a, b in pairs.tolist():
+        neighbours[a].append(b)
+        neighbours[b].append(a)
+    next_label = 0
+    for seed in range(count):
+        if labels[seed] >= 0:
+            continue
+        seed_normal = normals[seed]
+        labels[seed] = next_label
+        stack = [seed]
+        while stack:
+            current = stack.pop()
+            for other in neighbours[current]:
+                if labels[other] < 0 and float(np.dot(normals[other], seed_normal)) >= limit:
+                    labels[other] = next_label
+                    stack.append(other)
+        next_label += 1
+    return labels
+
+
+def _brep_min_corner(shape: object) -> np.ndarray | None:
+    try:
+        from OCP.Bnd import Bnd_Box
+        from OCP.BRepBndLib import BRepBndLib
+
+        box = Bnd_Box()
+        BRepBndLib.AddOptimal_s(shape, box, False, False)
+        if box.IsVoid():
+            return None
+        corner = box.CornerMin()  # Bnd_Box.Get() is not wrapped in this OCP build
+        return np.array([corner.X(), corner.Y(), corner.Z()], dtype=float)
+    except Exception:
+        return None
+
+
+def translate_solid_shape(shape: object, offset) -> object:
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Trsf, gp_Vec
+
+    transform = gp_Trsf()
+    transform.SetTranslation(gp_Vec(float(offset[0]), float(offset[1]), float(offset[2])))
+    return BRepBuilderAPI_Transform(shape, transform, True).Shape()
+
+
+def place_at_origin(geometry: ImportedGeometry) -> ImportedGeometry:
+    """Move mesh, edge mesh and B-rep so the bounding-box minimum corner is at (0, 0, 0)."""
+    corner = _brep_min_corner(geometry.brep_shape) if geometry.brep_shape is not None else None
+    if corner is None:
+        if geometry.mesh is None or geometry.mesh.n_points == 0:
+            return geometry
+        bounds = geometry.mesh.bounds
+        corner = np.array([bounds[0], bounds[2], bounds[4]], dtype=float)
+    return offset_geometry(geometry, -corner)
+
+
+def geometry_min_corner(geometry: ImportedGeometry) -> np.ndarray:
+    corner = _brep_min_corner(geometry.brep_shape) if geometry.brep_shape is not None else None
+    if corner is None:
+        bounds = geometry.mesh.bounds
+        corner = np.array([bounds[0], bounds[2], bounds[4]], dtype=float)
+    return corner
+
+
+def offset_geometry(geometry: ImportedGeometry, offset) -> ImportedGeometry:
+    """Translate mesh, edge mesh and B-rep by ``offset``; placement_offset accumulates it."""
+    offset = np.asarray(offset, dtype=float)
+    if not np.any(np.abs(offset) > 1e-12):
+        return geometry
+    mesh = geometry.mesh.translate(offset, inplace=False)
+    edge_mesh = (
+        geometry.edge_mesh.translate(offset, inplace=False) if geometry.edge_mesh is not None else None
+    )
+    brep_shape = geometry.brep_shape
+    solid_shape = geometry.solid_shape
+    if brep_shape is not None:
+        same = solid_shape is brep_shape
+        brep_shape = translate_solid_shape(brep_shape, offset)
+        if same:
+            solid_shape = brep_shape
+        elif solid_shape is not None:
+            solid_shape = translate_solid_shape(solid_shape, offset)
+    elif solid_shape is not None:
+        solid_shape = translate_solid_shape(solid_shape, offset)
+    return ImportedGeometry(
+        mesh,
+        brep_shape,
+        solid_shape,
+        edge_mesh,
+        geometry.solid_conversion_message,
+        geometry.native_brep,
+        geometry.unsupported,
+        tuple(float(a + b) for a, b in zip(geometry.placement_offset, offset)),
+    )
 
 
 def scale_solid_shape(shape: object, factor: float) -> object:

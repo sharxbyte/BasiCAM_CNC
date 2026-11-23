@@ -41,6 +41,20 @@ class ToolDefinition:
     shank_diameter_mm: float = 6.0
     cutting_length_mm: float = 18.0
     profile_points: list[tuple[float, float]] = field(default_factory=list)
+    corner_radius_mm: float = 0.0  # bull nose end mills (0 = sharp corner)
+    holder_diameter_mm: float = 0.0  # tool holder / collet nut: part of the collision envelope
+    holder_length_mm: float = 0.0
+    # lathe tools (v2 Block 21); lathe_kind "" = a milling tool
+    lathe_kind: str = ""  # "turning", "boring", "grooving", "parting", "threading", "drill"
+    insert_shape: str = "C"  # C D V W T R S
+    nose_radius_mm: float = 0.4
+    holder_angle_deg: float = 95.0
+    orientation: str = "OD"  # "OD", "ID" or "face"
+    groove_width_mm: float = 0.0
+    thread_pitch_min_mm: float = 0.0
+    thread_pitch_max_mm: float = 0.0
+    min_bore_mm: float = 0.0
+    station: int = 0  # turret station (0 = any)
 
     def __post_init__(self) -> None:
         if not self.profile_points:

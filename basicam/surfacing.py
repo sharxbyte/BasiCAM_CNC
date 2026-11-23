@@ -21,7 +21,7 @@ from shapely.ops import unary_union
 
 DEFAULT_OVERLAP = 0.40
 PATTERNS = ("Rectilinear", "Grid", "Linear carve")
-TOOL_SHAPES = ("Flat", "Ball")
+TOOL_SHAPES = ("Flat", "Ball", "Bull", "V-bit")
 
 
 @dataclass
@@ -35,6 +35,8 @@ class SurfaceParams:
     clearance_mm: float = 1.0
     remove_bulk: bool = True
     resolution_mm: float | None = None
+    corner_radius_mm: float = 0.0  # Bull nose
+    tip_angle_deg: float = 90.0  # V-bit included angle
 
     def stepover(self) -> float:
         return float(self.stepover_mm) if self.stepover_mm else self.tool_diameter_mm * (1.0 - DEFAULT_OVERLAP)
@@ -124,8 +126,26 @@ def height_map(mesh: pv.PolyData, step: float, margin: float) -> HeightMap:
     return HeightMap(xs, ys, z, step)
 
 
-def tool_envelope(hmap: HeightMap, shape: str, diameter: float) -> np.ndarray:
-    """Lowest tool-tip height at each grid point that does not touch the surface."""
+def _tool_lift(shape: str, r: float, d: float, corner_radius: float, angle_deg: float) -> float:
+    """Height of the cutter's underside above its tip at distance d from the axis (>= 0)."""
+    if shape == "Ball":
+        return r - math.sqrt(max(r * r - d * d, 0.0))
+    if shape == "Bull" and corner_radius > 0:
+        rc = min(corner_radius, r)
+        flat = r - rc
+        if d <= flat:
+            return 0.0
+        return rc - math.sqrt(max(rc * rc - (d - flat) ** 2, 0.0))
+    if shape == "V-bit":
+        half = math.radians(max(1.0, min(179.0, angle_deg)) / 2.0)
+        return d / math.tan(half)
+    return 0.0
+
+
+def tool_envelope(hmap: HeightMap, shape: str, diameter: float, corner_radius: float = 0.0, angle_deg: float = 90.0) -> np.ndarray:
+    """Lowest tool-tip height at each grid point that does not touch the surface.
+
+    Flat, Ball, Bull (corner radius) and V-bit (included angle) cutters."""
     r = diameter / 2.0
     n = int(math.ceil(r / hmap.step))
     env = np.full(hmap.z.shape, -np.inf)
@@ -137,11 +157,8 @@ def tool_envelope(hmap: HeightMap, shape: str, diameter: float) -> np.ndarray:
             if d > r + 1e-9:
                 continue
             window = padded[n + di : n + di + rows, n + dj : n + dj + cols]
-            if shape == "Ball":
-                lift = math.sqrt(max(r * r - d * d, 0.0)) - r
-                env = np.maximum(env, window + lift)
-            else:
-                env = np.maximum(env, window)
+            # the tip sits so that the cutter at distance d clears the surface: tip >= z - lift
+            env = np.maximum(env, window - _tool_lift(shape, r, d, corner_radius, angle_deg))
     return env
 
 
@@ -191,7 +208,7 @@ def plan_surface(mesh: pv.PolyData, params: SurfaceParams, stock_top_z: float | 
     """Roughing layers (optional) then the 3-axis finishing passes."""
     step = params.resolution()
     hmap = height_map(mesh, step, margin=params.tool_diameter_mm)
-    env = tool_envelope(hmap, params.tool_shape, params.tool_diameter_mm)
+    env = tool_envelope(hmap, params.tool_shape, params.tool_diameter_mm, params.corner_radius_mm, params.tip_angle_deg)
     region = region_polygon(mesh, params.clearance_mm)
     lines = _raster_lines(region, params.stepover(), params.pattern)
     plan = SurfacePlan()
@@ -254,8 +271,11 @@ def min_clearance_to_surface(passes, hmap: HeightMap) -> float:
 
 
 # ---------------------------------------------------------------------- dialog
-def trace_surface_dialog(parent, tools, default_diameter: float):
-    """Trace curved face: tool, stepover/stepdown, pattern, remove bulk; returns SurfaceParams or None."""
+def trace_surface_dialog(parent, tools, default_diameter: float, fixed_tool: str = ""):
+    """Surface pass settings: tool, stepover/stepdown, pattern, stock to leave, remove bulk.
+
+    ``fixed_tool``: the tool was already picked from the inventory (Assign tool), so only the
+    advanced settings are shown. Returns SurfaceParams or None."""
     from PySide6.QtWidgets import (
         QCheckBox,
         QComboBox,
@@ -267,16 +287,17 @@ def trace_surface_dialog(parent, tools, default_diameter: float):
     )
 
     dialog = QDialog(parent)
-    dialog.setWindowTitle("Trace curved face")
+    dialog.setWindowTitle(f"Assign tool · {fixed_tool}" if fixed_tool else "Trace curved face")
     form = QFormLayout(dialog)
     shape = QComboBox()
     shape.addItems(list(TOOL_SHAPES))
-    form.addRow("Tool type", shape)
     diameter = QDoubleSpinBox()
     diameter.setRange(0.1, 100.0)
     diameter.setValue(default_diameter)
     diameter.setSuffix(" mm")
-    form.addRow("Tool diameter", diameter)
+    if not fixed_tool:
+        form.addRow("Tool type", shape)
+        form.addRow("Tool diameter", diameter)
     stepover = QDoubleSpinBox()
     stepover.setRange(0.01, 100.0)
     stepover.setValue(default_diameter * (1.0 - DEFAULT_OVERLAP))
@@ -291,6 +312,13 @@ def trace_surface_dialog(parent, tools, default_diameter: float):
     pattern = QComboBox()
     pattern.addItems(list(PATTERNS))
     form.addRow("Pattern", pattern)
+    leave = QDoubleSpinBox()
+    leave.setRange(0.0, 20.0)
+    leave.setDecimals(3)
+    leave.setValue(0.3)
+    leave.setSuffix(" mm")
+    leave.setToolTip("Material the roughing passes leave on the surface for the finishing passes.")
+    form.addRow("Stock to leave", leave)
     bulk = QCheckBox("Remove bulk first, then 3-axis contour")
     bulk.setChecked(True)
     form.addRow("", bulk)
@@ -306,4 +334,5 @@ def trace_surface_dialog(parent, tools, default_diameter: float):
     return SurfaceParams(
         tool_shape=shape.currentText(), tool_diameter_mm=diameter.value(), stepover_mm=stepover.value(),
         stepdown_mm=stepdown.value(), pattern=pattern.currentText(), remove_bulk=bulk.isChecked(),
+        stock_to_leave_mm=leave.value(),
     )
