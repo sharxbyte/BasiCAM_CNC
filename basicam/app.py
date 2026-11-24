@@ -108,6 +108,11 @@ from basicam.operations import Operation, operation_warnings
 from basicam.readiness import gcode_readiness
 from basicam.sketches import SketchEntity, construction_line
 from basicam.tooling_ui import ToolLibraryDialog
+from basicam.window_fit import WindowFitter, fit_to_screen, make_working_window
+from basicam import ui_visibility
+from basicam.grbl_handshake import Handshake, all_limits_active, describe_pins, limit_diagnostic
+from basicam import machine_readiness as readiness_rules
+from basicam.jog_pad import JogPad
 from basicam.units import LengthUnit, UnitSettings
 from vtkmodules.vtkInteractionWidgets import vtkCameraOrientationWidget
 from basicam.gcode import GCodeSettings, generate_gcode
@@ -118,7 +123,7 @@ from basicam.feeds_speeds import (
 )
 from basicam.setups import SETUP_PALETTE, MachiningSetup
 from basicam.stock_analysis import RoughingAnalysis
-from basicam.tooling import ToolDefinition, create_tool_mesh, default_tool_inventory
+from basicam.tooling import ToolDefinition, create_tool_mesh, default_tool_inventory, migrate_library_entries
 from basicam.sketch_workflow import (
     ParametricSketchFeature,
     SketchDimension,
@@ -163,7 +168,6 @@ from basicam.cam_library_validation import (
     DEFAULT_TOOL_LIBRARY,
     GCodeValidationIssue,
     GCodeValidator,
-    ToolLibraryEntry,
 )
 from basicam.cam_fixtures_speeds_export import (
     CollisionAndFixtureManager,
@@ -295,6 +299,15 @@ def _number(token: str) -> float:
     return float(token)
 
 
+def _alive(widget) -> bool:
+    """False once Qt has deleted the widget (a closed dialog's pad)."""
+    try:
+        widget.objectName()
+        return True
+    except RuntimeError:
+        return False
+
+
 def parse_length_to_mm(text: str, default_unit_mm: float = 1.0) -> float | None:
     """Parse '12.5 mm', '1/2 in', '1 1/4"', '3 ft', '5\\' 3 1/2"' into millimetres.
 
@@ -406,7 +419,8 @@ class WorkspaceBundleMixin:
         self.current_bcam_path: Path | None = None
         self.session_manager.mark_session_started()
         self._bind_bundle_actions()
-        self._check_crash_recovery()
+        # Runs once the window is built: restoring a snapshot needs the project panel and stock widgets.
+        QTimer.singleShot(0, self, self._check_crash_recovery)  # dropped if the window is gone first
 
     def _bind_bundle_actions(self) -> None:
         self.save_bcam_action = QAction("Save Project (.bcam)", self)
@@ -608,7 +622,10 @@ class WorkspaceBundleMixin:
         self.stock_imported = bool(snapshot.stock_imported)
         self.stock_note = snapshot.stock_note
         self.job_notes = snapshot.job_notes
-        self.project_name_label.setText(snapshot.job_name)
+        job_name = (snapshot.job_name or "").strip()
+        if job_name in ("", "Untitled job") and parts:
+            job_name = parts[0].name  # an unnamed project takes the name of its part
+        self.project_name_label.setText(job_name or "Untitled job")
         self.stock_material.setCurrentText(snapshot.stock_material)
         for axis, spin in self.stock_dimensions.items():
             if axis in snapshot.stock_dimensions:
@@ -710,6 +727,7 @@ class WorkspaceBundleMixin:
         self._project_dirty = False
         self._update_window_title()
         self.statusBar().showMessage(f"Opened {Path(file_path).name}", 4000)
+        self.check_project_tools()
 
     def _autosave_if_due(self) -> None:
         try:
@@ -755,10 +773,10 @@ class CamWorkspaceTabsMixin:
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # v3 Block 3: the tool inventory is the only tool list; this combo follows it.
         self.tool_library_combo = QComboBox()
-        for entry in getattr(self, "tool_library", []):
-            self.tool_library_combo.addItem(f"{entry.tool_id} · {entry.name} (Ø{entry.diameter_mm:g}mm)", entry.tool_id)
-        layout.addWidget(QLabel("Tool Library"))
+        self.tool_library_combo.currentIndexChanged.connect(self._on_library_tool_changed)
+        layout.addWidget(QLabel("Tool inventory"))
         layout.addWidget(self.tool_library_combo)
 
         apply_tool_btn = QPushButton("Load Selected Tool")
@@ -772,6 +790,7 @@ class CamWorkspaceTabsMixin:
         self.flutes_spin.setValue(2)
         flutes_row.addWidget(self.flutes_spin)
         layout.addLayout(flutes_row)
+        self._refresh_library_combo()
 
         calc_btn = QPushButton("Calculate Feeds && Speeds")
         calc_btn.clicked.connect(self._on_calc_feeds_speeds_clicked)
@@ -901,14 +920,33 @@ class CamWorkspaceTabsMixin:
         layout.addWidget(self.setup_sheet_preview)
         return tab
 
+    def _refresh_library_combo(self) -> None:
+        if not hasattr(self, "tool_library_combo"):
+            return
+        current = self.tool_library_combo.currentText().split(" (Ø")[0]
+        self.tool_library_combo.blockSignals(True)
+        self.tool_library_combo.clear()
+        for index, tool in enumerate(getattr(self, "tools", []) or []):
+            self.tool_library_combo.addItem(f"{tool.name} (Ø{tool.diameter_mm:g} mm, {tool.flute_count} fl)", index)
+        found = next((i for i, tool in enumerate(getattr(self, "tools", []) or []) if tool.name == current), 0)
+        if self.tool_library_combo.count():
+            self.tool_library_combo.setCurrentIndex(found)
+        self.tool_library_combo.blockSignals(False)
+        self._on_library_tool_changed()
+
+    def _on_library_tool_changed(self, *_args) -> None:
+        index = self.tool_library_combo.currentData() if hasattr(self, "tool_library_combo") else None
+        tools = getattr(self, "tools", []) or []
+        if isinstance(index, int) and 0 <= index < len(tools) and hasattr(self, "flutes_spin"):
+            self.flutes_spin.setValue(max(1, min(int(tools[index].flute_count or 1), self.flutes_spin.maximum())))
+
     def _on_apply_library_tool_clicked(self) -> None:
-        tool_id = self.tool_library_combo.currentData()
-        if tool_id and hasattr(self, "apply_tool_library_entry"):
-            entry = self.apply_tool_library_entry(str(tool_id))
-            if entry is not None:
-                self.speeds_readout.setPlainText(
-                    f"Loaded {entry.name}\nRPM: {entry.default_rpm} | Feed: {entry.default_feed_mm_min} mm/min | Stepdown: {entry.default_stepdown_mm} mm"
-                )
+        index = self.tool_library_combo.currentData()
+        tool = self.apply_inventory_tool(index) if isinstance(index, int) else None
+        if tool is not None:
+            self.speeds_readout.setPlainText(
+                f"Loaded {tool.name}\nDiameter: {tool.diameter_mm:g} mm | Flutes: {tool.flute_count} | Type: {tool.tool_type}"
+            )
 
     def _on_calc_feeds_speeds_clicked(self) -> None:
         if hasattr(self, "recommend_feeds_and_speeds"):
@@ -1256,7 +1294,10 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.machine_store = MachineStore(self.settings)
         self.material_store = MaterialStore(self.settings)
         self.stock_spec: StockSpec | None = None
-        self.current_machine: MachineProfile | None = self.machine_store.get(self.machine_store.default_id)
+        # start-up selects the last loaded machine again; it is never connected automatically
+        self.current_machine: MachineProfile | None = self.machine_store.get(
+            self.settings.value("machines/last", "") or self.machine_store.default_id
+        ) or self.machine_store.get(self.machine_store.default_id)
         self.last_wco: tuple[float, float, float] | None = None
         self.preflight_complete = False
         self._preflight_pending = False
@@ -1264,9 +1305,11 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.motion_guard = MotionGuard(self)
         self.setWindowTitle("BasiCAM CNC")
         self.resize(1500, 930)
+        # Every dialog fits the screen it opens on and remembers its size (roadmap v3 Block 1).
+        self.window_fitter = WindowFitter(self.settings, self)
+        QApplication.instance().installEventFilter(self.window_fitter)
         self.init_bundle_and_history()
         self.feature_recognizer = DynamicFeatureRecognizer()
-        self.tool_library: list[ToolLibraryEntry] = list(DEFAULT_TOOL_LIBRARY)
         self.gcode_validator = GCodeValidator()
         self.fixture_manager = CollisionAndFixtureManager()
         self.feeds_speeds_calc = FeedsAndSpeedsCalculator()
@@ -1282,6 +1325,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             PostProcessorSpec(name="Generic GRBL / 3-Axis", controller="grbl")
         )
         self.tools = self._load_tool_inventory()
+        self._refresh_library_combo()  # Tools & Speeds lists the inventory
         self.command_actions: dict[str, QAction] = {}
         _raw_orbit = self.settings.value("view/orbit_sensitivity", 0.45, type=float)
         self.orbit_sensitivity = float(_raw_orbit if isinstance(_raw_orbit, (int, float)) else 0.45)
@@ -1561,19 +1605,90 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.machine_dock.visibilityChanged.connect(self._terminal_takeover)
         self._build_menus()
         apply_tooltips(self)
+        self._apply_machine_visibility()
+        self._set_machine_controls()  # menu commands start disabled until a controller is identified
         self.statusBar().showMessage("Ready")
+        self.main_kill_button = QPushButton("KILL")
+        self.main_kill_button.setObjectName("mainKillButton")
+        self.main_kill_button.setToolTip("Feed hold, soft reset, spindle and beam off. Always here, whatever panels are open.")
+        self.main_kill_button.setStyleSheet("QPushButton#mainKillButton { font-weight: 800; padding: 2px 18px; }")
+        self.main_kill_button.clicked.connect(self._kill_machine)
+        self.main_kill_button.setEnabled(False)
+        self.statusBar().addPermanentWidget(self.main_kill_button)
         self.statusBar().setStyleSheet(
             f"background:{COLORS['panel']};color:{COLORS['muted']};padding:5px 10px"
         )
 
     def _load_tool_inventory(self) -> list[ToolDefinition]:
+        tools = None
         serialized = self.settings.value("tools/inventory", "")
         if serialized:
             try:
-                return [ToolDefinition.from_dict(item) for item in json.loads(serialized)]
+                tools = [ToolDefinition.from_dict(item) for item in json.loads(serialized)]
             except (TypeError, ValueError, KeyError):
                 self.settings.remove("tools/inventory")
-        return default_tool_inventory()
+        if tools is None:
+            tools = default_tool_inventory()
+        if not self.settings.value("tools/library_migrated", False, type=bool):
+            # v3 Block 3: the old separate "Tools & Speeds" list joins the inventory once; a tool the
+            # owner deletes afterwards is not added again.
+            tools = migrate_library_entries(tools, DEFAULT_TOOL_LIBRARY)
+            self.settings.setValue("tools/library_migrated", True)
+            self.settings.setValue("tools/inventory", json.dumps([tool.to_dict() for tool in tools]))
+        return tools
+
+    def _set_tool_inventory(self, tools: list[ToolDefinition]) -> bool:
+        """Write the inventory at once (tool window Add / update and Remove) and refresh every list."""
+        self.tools = list(tools)
+        self.settings.setValue("tools/inventory", json.dumps([tool.to_dict() for tool in self.tools]))
+        self.settings.sync()
+        ok = self.settings.status() == type(self.settings).Status.NoError
+        if not ok:
+            self._critical_box(self, "Tool inventory", "The tool inventory could not be saved to the settings file.")
+        self._tools_changed()
+        return ok
+
+    def _tools_changed(self) -> None:
+        """Every tool list reads self.tools: operation combo, Tools & Speeds, tool table."""
+        self._refresh_tool_combo()
+        self._refresh_library_combo()
+        if hasattr(self, "_refresh_tool_table_panel"):
+            try:
+                self._refresh_tool_table_panel()
+            except Exception:  # noqa: BLE001 - a panel refresh must not lose the saved inventory
+                pass
+
+    def check_project_tools(self, ask: bool = True) -> list[str]:
+        """Tools used by the project's operations but missing from this computer's inventory."""
+        names = {tool.name for tool in self.tools}
+        missing: dict[str, object] = {}
+        for op in getattr(self, "operations", []) or []:
+            if op.tool and op.tool not in names and op.tool not in missing:
+                missing[op.tool] = op
+        if missing:
+            self.terminal_core.log(
+                "warning", "Tools missing from this computer's inventory: " + ", ".join(sorted(missing))
+            )
+        if missing and ask:
+            answer = QMessageBox.question(
+                self,
+                "Missing tools",
+                "This project uses tools that are not in this computer's tool inventory:\n\n"
+                + "\n".join(f"- {name}" for name in sorted(missing))
+                + "\n\nAdd them to the inventory, with the diameters the operations use? "
+                "Check their lengths in the tool inventory afterwards.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                added = []
+                for name, op in missing.items():
+                    diameter = float(getattr(op, "tool_diameter_mm", 6.0) or 6.0)
+                    kind = "Drill" if str(getattr(op, "kind", "")) == "Drill" else "End mill"
+                    added.append(ToolDefinition(name, kind, diameter_mm=diameter, shank_diameter_mm=diameter))
+                self._set_tool_inventory(self.tools + added)
+                return []
+        return sorted(missing)
 
     def _refresh_tool_combo(self) -> None:
         if not hasattr(self, "tool_name"):
@@ -1678,16 +1793,17 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         for widget in (self.stepdown, self.depth):
             self.operation_form.setRowVisible(widget, visible)
 
-    def open_tool_library(self) -> None:
+    def open_tool_library(self, tab: str | None = None) -> None:
         dialog = ToolLibraryDialog(
-            self.tools, self, machine_store=self.machine_store, material_store=self.material_store
+            self.tools, self, machine_store=self.machine_store, material_store=self.material_store,
+            connect_callback=self.connect_machine_profile, is_connected=self._machine_is_connected,
+            on_change=self._set_tool_inventory, inches=self.units.display is LengthUnit.INCHES,
         )
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.tools = dialog.tools
-            self.settings.setValue(
-                "tools/inventory", json.dumps([tool.to_dict() for tool in self.tools])
-            )
-            self._refresh_tool_combo()
+        if isinstance(tab, str) and getattr(dialog, "tabs", None) is not None:
+            for index in range(dialog.tabs.count()):
+                if dialog.tabs.tabText(index).startswith(tab):
+                    dialog.tabs.setCurrentIndex(index)
+        dialog.exec()  # tools are saved on every Add / update and Remove, however the window closes
         self._refresh_machine_combo()
         if self.current_machine is not None:
             updated = self.machine_store.get(self.current_machine.machine_id)
@@ -1724,6 +1840,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if hasattr(self, "jog_distance"):
             state["jog_distance"] = self.jog_distance.value()
             state["jog_feed"] = self.jog_feed.value()
+        if hasattr(self, "jog_pad"):
+            state["jog_pad"] = self.jog_pad.state()
         return state
 
     def _save_machine_state(self) -> None:
@@ -1749,6 +1867,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if hasattr(self, "jog_distance") and "jog_distance" in state:
             self.jog_distance.setValue(float(state["jog_distance"]))
             self.jog_feed.setValue(float(state["jog_feed"]))
+        if hasattr(self, "jog_pad"):
+            self.jog_pad.apply_state(state.get("jog_pad"))
         if state.get("tool") and hasattr(self, "tool_name"):
             index = self.tool_name.findText(str(state["tool"]))
             if index >= 0:
@@ -1757,10 +1877,89 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
     def _sync_machine_profile(self) -> None:
         profile = self.current_machine.kinematics_profile() if self.current_machine else MachineKinematicsProfile()
         self.envelope_checker = MachineEnvelopeChecker(profile)
+        if hasattr(self, "jog_pad") and self.current_machine is not None:
+            feeds = tuple(self.current_machine.max_feed_mm_min) + (None, None, None)
+            self.jog_pad.set_feed_limits(min(feeds[0] or 1e9, feeds[1] or 1e9), feeds[2])
+        self._apply_machine_visibility()
         if hasattr(self, "usage_table"):
             self._refresh_aux_usage_panel()
         if hasattr(self, "tool_table_widget"):
             self._refresh_tool_table_panel()
+
+    # ------------------------------------------------------------ machine-type visibility (v3 Block 5)
+    def machine_traits(self) -> set[str]:
+        stock_kind = getattr(getattr(self, "stock_spec", None), "kind", "")
+        return ui_visibility.machine_traits(getattr(self, "current_machine", None), stock_kind)
+
+    def _show_all_machine_options(self) -> bool:
+        return bool(self.settings.value("ui/show_all_machine_types", False, type=bool))
+
+    def command_available(self, name: str) -> bool:
+        rule = ui_visibility.COMMAND_RULES.get(name)
+        return self._show_all_machine_options() or ui_visibility.visible(rule, self.machine_traits())
+
+    def _apply_machine_visibility(self) -> None:
+        """Hide what the loaded machine cannot use: menus, commands (and their shortcuts), dock tabs,
+        fields and operation types. Runs on machine change, project load and at start-up."""
+        if not hasattr(self, "command_actions"):
+            return
+        traits = self.machine_traits()
+        show_all = self._show_all_machine_options()
+
+        def shown(rule) -> bool:
+            return show_all or ui_visibility.visible(rule, traits)
+
+        for name, rule in ui_visibility.COMMAND_RULES.items():
+            action = self.command_actions.get(name)
+            if action is not None:
+                action.setVisible(shown(rule))  # a hidden action's shortcut does not fire
+                action.setEnabled(shown(rule))
+        for title, rule in ui_visibility.MENU_RULES.items():
+            menu = getattr(self, "machine_menus", {}).get(title)
+            if menu is not None:
+                menu.menuAction().setVisible(shown(rule))
+        tabs = getattr(self, "machine_tabs", None)
+        if tabs is not None:
+            for index in range(tabs.count()):
+                rule = ui_visibility.PANEL_RULES.get(tabs.tabText(index))
+                if rule is not None:
+                    tabs.setTabVisible(index, shown(rule))
+        for attribute, rule in ui_visibility.WIDGET_RULES.items():
+            widget = getattr(self, attribute, None)
+            if widget is not None:
+                widget.setVisible(shown(rule))
+        for attribute in ui_visibility.NEVER_HIDDEN:
+            widget = getattr(self, attribute, None)
+            if widget is not None:
+                widget.setVisible(True)
+        self._refresh_operation_kinds(traits, show_all)
+
+    def _refresh_operation_kinds(self, traits: set[str] | None = None, show_all: bool | None = None) -> None:
+        combo = getattr(self, "operation_kind", None)
+        if combo is None:
+            return
+        traits = self.machine_traits() if traits is None else traits
+        show_all = self._show_all_machine_options() if show_all is None else show_all
+        kinds = list(ui_visibility.ALL_KINDS) if show_all else ui_visibility.operation_kinds(traits)
+        current = combo.currentText()
+        if current and current not in kinds:
+            kinds.append(current)  # an operation of another machine type keeps its kind (never deleted)
+        if [combo.itemText(i) for i in range(combo.count())] != kinds:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(kinds)
+            combo.setCurrentText(current if current in kinds else kinds[0])
+            combo.blockSignals(False)
+        self._update_operation_kind_note()
+
+    def _update_operation_kind_note(self, *_args) -> None:
+        note = getattr(self, "operation_kind_note", None)
+        if note is None:
+            return
+        kind = self.operation_kind.currentText()
+        available = self._show_all_machine_options() or kind in ui_visibility.operation_kinds(self.machine_traits())
+        note.setText("" if available else f"{kind}: {ui_visibility.needs_text(kind)}")
+        note.setVisible(not available)
 
     def _set_current_machine(self, machine_id: str | None, load_state: bool = True) -> None:
         """Select a machine for this project and as the default for new projects."""
@@ -1770,10 +1969,15 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             machine = self.current_machine
         self.current_machine = machine
         self.machine_store.default_id = machine.machine_id if machine else None
+        if machine is not None:
+            self.settings.setValue("machines/last", machine.machine_id)
         self.last_wco = None
         if load_state:
             self._load_machine_state()
         self._sync_machine_profile()
+        if machine is not None and machine.port and self.grbl_controller is None and hasattr(self, "port_combo"):
+            if self.port_combo.findData(machine.port) >= 0:  # preselect its port and baud rate
+                self._apply_machine_port(machine)
         self._refresh_machine_combo()
         self._mark_dirty()
         self.terminal_core.log("info", f"Machine: {machine.name if machine else 'none selected'}")
@@ -1789,7 +1993,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             status = self.grbl_status
             return status.machine_position if status is not None and status.machine_position else None
 
-        wizard = SoftLimitWizard(copy.deepcopy(self.current_machine), self.safety, self.tools, position, self)
+        wizard = SoftLimitWizard(copy.deepcopy(self.current_machine), self.safety, self.tools, position, self,
+                                 pad=self.make_jog_pad(), kill=self._kill_machine)
         if wizard.exec() == QDialog.DialogCode.Accepted:
             self.current_machine = wizard.machine
             self.machine_store.save(self.current_machine)
@@ -1803,11 +2008,21 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if getattr(self, "_preflight_dialog", None) is not None and self._preflight_dialog.isVisible():
             return
         axes = self.grbl_capabilities.axes if self.grbl_capabilities else "XYZ"
-        dialog = PreflightDialog(self.current_machine, axes, self)
+        pad = self.make_jog_pad()
+        pad.preflight = True  # v3 Block 10: preflight jogs (position verified, preflight not yet done)
+        actions = {
+            "home": self._home_machine,
+            "unlock": self._unlock_machine,
+            "hold": lambda: self._send_realtime(b"!", "Feed hold"),
+            "kill": self._kill_machine,
+        }
+        dialog = PreflightDialog(self.current_machine, axes, self, pad=pad, actions=actions)
         dialog.finished.connect(lambda result, d=dialog: self._preflight_finished(d, result))
         self._preflight_dialog = dialog
         self.terminal_core.log("warning", "Preflight: move each axis through its travel and tick it to enable motion.")
-        dialog.open()
+        dialog.setModal(False)  # the console and DRO stay usable
+        dialog.show()
+        self._set_machine_controls()
 
     def _preflight_finished(self, dialog, result: int) -> None:
         self._preflight_dialog = None
@@ -1975,6 +2190,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self._add_command(tools_menu, "assign_tool_surface", "Assign tool to surface...", "", lambda *_: self.assign_tool_to_surface())
         self._add_command(tools_menu, "laser_test_fire", "Laser test fire", "", lambda *_: self.test_fire())
         turning_menu = self.menuBar().addMenu("Turning")
+        self.machine_menus = {"Turning": turning_menu}  # menus hidden per machine type (v3 Block 5)
         self._add_command(turning_menu, "turning_setup", "Turning setup...", "", lambda *_: self.turning_setup_dialog())
         self._add_command(turning_menu, "turning_side_view", "Side view", "", lambda *_: self.show_turning_side_view(True))
         self._add_command(turning_menu, "turning_silhouette", "Convert part silhouette", "", lambda *_: self.convert_part_silhouette())
@@ -2023,6 +2239,14 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.advanced_settings_action.setVisible(not self.safety.beginner_mode)
 
         machine_menu = self.menuBar().addMenu("Machine")
+        self._add_command(machine_menu, "machine_inventory", "Machine inventory...", "", lambda *_: self.open_machine_inventory())
+        self._add_command(machine_menu, "machine_load_last", "Load last machine", "", lambda *_: self.load_last_machine())
+        self.connect_action = self._add_command(machine_menu, "machine_connect", "Connect", "", lambda *_: self._toggle_machine_connection())
+        self._add_command(machine_menu, "machine_ports", "Ports...", "", lambda *_: self.open_ports_dialog())
+        self._add_command(machine_menu, "machine_test", "Test connection", "", lambda *_: self.test_connection())
+        self._add_command(machine_menu, "machine_reset_connection", "Reset connection", "", lambda *_: self.reset_connection())
+        self._add_command(machine_menu, "machine_manual", "Manual controller", "", lambda *_: self.show_manual_controller())
+        machine_menu.addSeparator()
         for axis in "XYZ":
             for sign, label in ((-1, "−"), (1, "+")):
                 self._add_command(
@@ -2038,7 +2262,6 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self._add_command(view_menu, "work_axes", "Assign work axes...", "", self._show_axes_assignment)
 
         window_menu = self.menuBar().addMenu("Window")
-        window_menu.addAction(self.machine_dock.toggleViewAction())
         window_menu.addAction(self.terminal.toggleViewAction())
         self.terminal_collapse_action = QAction("Collapse terminal", self)
         self.terminal_collapse_action.setCheckable(True)
@@ -2059,6 +2282,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             Qt.DockWidgetArea.BottomDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
         tabs = QTabWidget()
+        self.machine_tabs = tabs
         machine = QWidget()
         machine_layout = QHBoxLayout(machine)
         connection_panel = QVBoxLayout()
@@ -2078,8 +2302,15 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         port_row.addWidget(refresh_ports)
         connection_panel.addLayout(port_row)
         connect_row = QHBoxLayout()
+        connect_row.addWidget(QLabel("Baud rate"))
         self.baud_combo = QComboBox()
-        self.baud_combo.addItems(["115200", "57600", "250000"])
+        self.baud_combo.setEditable(True)
+        self.baud_combo.addItems(["Auto", "115200", "250000", "230400", "57600", "38400", "19200", "9600"])
+        self.baud_combo.setCurrentText("115200")
+        self.baud_combo.setToolTip(
+            "The serial speed set in the controller firmware; it must match. GRBL and grblHAL usually use "
+            "115200. Auto tries the common rates and keeps the one that answers."
+        )
         connect_row.addWidget(self.baud_combo)
         self.connect_button = QPushButton("Connect")
         self.connect_button.clicked.connect(self._toggle_machine_connection)
@@ -2092,6 +2323,21 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.machine_info_label.setObjectName("mutedText")
         self.machine_info_label.setWordWrap(True)
         connection_panel.addWidget(self.machine_info_label)
+        self.machine_diag_label = QLabel("")  # connection / limit diagnostics; stays until resolved
+        self.machine_diag_label.setObjectName("warningLabel")
+        self.machine_diag_label.setWordWrap(True)
+        self.machine_diag_label.setVisible(False)
+        connection_panel.addWidget(self.machine_diag_label)
+        self._build_ready_checklist(connection_panel)
+        pins_row = QHBoxLayout()
+        self.pins_label = QLabel("Inputs: -")
+        self.pins_label.setToolTip("Limit switches and inputs the controller reports as active (Pn:).")
+        pins_row.addWidget(self.pins_label, 1)
+        self.limit_test_button = QPushButton("Limit-switch test...")
+        self.limit_test_button.setToolTip("Press each limit switch by hand and watch its input change; nothing moves.")
+        self.limit_test_button.clicked.connect(lambda *_: self.open_limit_switch_test())
+        pins_row.addWidget(self.limit_test_button)
+        connection_panel.addLayout(pins_row)
         self.position_verified_box = QCheckBox("Machine position homed / verified")
         self.position_verified_box.toggled.connect(self._set_position_verified)
         connection_panel.addWidget(self.position_verified_box)
@@ -2104,24 +2350,28 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         connection_panel.addWidget(zero_btn)
         machine_layout.addLayout(connection_panel, 2)
 
-        jog_group = QGroupBox("Jog · mm")
+        jog_group = QGroupBox("Manual controller")
         jog_layout = QGridLayout(jog_group)
+        # legacy step / feed (saved per machine; the pad below supplies the values used)
         self.jog_distance = self._double_spin(1.0, 0.01, 25.0, 2)
         self.jog_feed = self._double_spin(300.0, 1.0, 5000.0, 1)
-        jog_layout.addWidget(QLabel("Step"), 0, 0)
-        jog_layout.addWidget(self.jog_distance, 0, 1, 1, 2)
-        jog_layout.addWidget(QLabel("Feed"), 1, 0)
-        jog_layout.addWidget(self.jog_feed, 1, 1, 1, 2)
-        self.jog_buttons: dict[str, QPushButton] = {}
-        for axis_index, axis in enumerate("XYZ"):
-            for direction_index, sign in enumerate((-1, 1)):
-                label = f"{axis}{'−' if sign < 0 else '+'}"
-                button = QPushButton(label)
-                button.clicked.connect(
-                    lambda checked=False, a=axis, s=sign: self._jog_axis(a, s)
-                )
-                self.jog_buttons[label] = button
-                jog_layout.addWidget(button, 2 + axis_index, direction_index)
+        self.jog_distance.setVisible(False)
+        self.jog_feed.setVisible(False)
+        # v3 Block 9: X/Y cross with diagonals, Z beside it, per-axis increments, KILL on the pad
+        self.jog_pad = JogPad(
+            jog=lambda moves, feed: self._jog_moves(moves, feed),
+            kill=self._kill_machine,
+            go_to_zero=self.go_to_work_zero_xy,
+            jog_hold=self._jog_hold,
+            jog_cancel=self._jog_cancel,
+            parse=lambda text: parse_length_to_mm(text, 25.4 if self.units.display is LengthUnit.INCHES else 1.0),
+            inches=self.units.display is LengthUnit.INCHES,
+        )
+        self.jog_pad.settingsChanged.connect(self._save_machine_state)
+        jog_layout.addWidget(self.jog_pad, 0, 0, 5, 2)
+        self.jog_buttons: dict[str, QPushButton] = {
+            key.replace("-", "−") if len(key) == 2 else key: button for key, button in self.jog_pad.buttons.items()
+        }
         self.keyboard_control_toggle = QPushButton("Keyboard control")
         self.keyboard_control_toggle.setCheckable(True)
         self.keyboard_control_toggle.setToolTip(
@@ -2392,6 +2642,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         current = TurningSetup.from_dict(getattr(self.active_setup, "turning", None))
         dialog = QDialog(self)
         dialog.setWindowTitle("Turning setup")
+        make_working_window(dialog)
         form = QFormLayout(dialog)
 
         def spin(value, lo=-10000.0, hi=10000.0, suffix=" mm"):
@@ -2740,6 +2991,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         settings = self._nest_settings()
         dialog = QDialog(self)
         dialog.setWindowTitle("Nest parts")
+        make_working_window(dialog)
         form = QFormLayout(dialog)
         spacing = QDoubleSpinBox()
         spacing.setRange(0.0, 100.0)
@@ -3117,8 +3369,10 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             return
         while self.aux_buttons_row.count():
             item = self.aux_buttons_row.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)  # gone at once, not after the next event loop pass
+                widget.deleteLater()
         machine = getattr(self, "current_machine", None)
         for output in (machine.aux_output_list() if machine is not None else []):
             button = QPushButton(AUX_KINDS.get(output.kind, output.kind).split(" (")[0])
@@ -3294,7 +3548,82 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if self.port_combo.count() == 0:
             self.port_combo.addItem("No serial ports found", "")
 
+    def _connected_port(self) -> str:
+        controller = self.grbl_controller
+        if controller is None:
+            return ""
+        port = getattr(controller, "port", "")
+        return str(getattr(port, "port", port) or "")
+
+    def _machine_is_connected(self, machine) -> bool:
+        return bool(machine is not None and machine.port and self._connected_port() == machine.port)
+
+    def _apply_machine_port(self, machine) -> bool:
+        """Select the profile's port and baud rate in the machine dock. False when the port is absent."""
+        if machine is None or not getattr(machine, "port", "") or not hasattr(self, "port_combo"):
+            return False
+        self._refresh_machine_ports()
+        index = self.port_combo.findData(machine.port)
+        found = index >= 0
+        if not found:
+            self.port_combo.addItem(f"{machine.port} · not found", machine.port)
+            index = self.port_combo.count() - 1
+        self.port_combo.setCurrentIndex(index)
+        baud = str(int(getattr(machine, "baud", 115200) or 115200))
+        if self.baud_combo.findText(baud) < 0:
+            self.baud_combo.addItem(baud)
+        self.baud_combo.setCurrentText(baud)
+        return found
+
+    def connect_machine_profile(self, machine) -> bool:
+        """Machines tab > Connect: load the machine, then the normal connect path (with its warning)."""
+        if machine is None:
+            return False
+        if self.grbl_controller is not None:
+            if self._machine_is_connected(machine):
+                QMessageBox.information(self, "Connect", f"{machine.name} is already connected.")
+                return True
+            QMessageBox.information(
+                self, "Connect", f"Disconnect from {self._connected_port()} first, then connect to {machine.name}."
+            )
+            return False
+        if self.current_machine is None or self.current_machine.machine_id != machine.machine_id:
+            self._set_current_machine(machine.machine_id)
+        if not self._apply_machine_port(machine):
+            QMessageBox.warning(
+                self, "Connect",
+                f"Port {machine.port} is not available. Check the cable and Machine > Ports..., then try again.",
+            )
+            return False
+        self._toggle_machine_connection()
+        return self.grbl_controller is not None
+
     def _toggle_machine_connection(self) -> None:
+        if self.grbl_controller is not None:
+            self._disconnect_controller()
+            return
+        port = self.port_combo.currentData()
+        if not port:
+            self.machine_status_label.setText("Select an available serial port first.")
+            return
+        if not self._confirm_connect():
+            return
+        self._open_controller(str(port), self.baud_combo.currentText())
+
+    def _confirm_connect(self) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Connect to GRBL controller",
+            "Only GRBL-protocol controllers (GRBL 1.1, grblHAL, FluidNC) are supported. Opening a serial port "
+            "can reset some controllers.\n\n"
+            "Confirm the machine is clear, the emergency stop is accessible, and the selected port is correct.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _disconnect_controller(self) -> None:
+        self._clear_user_position()
         if self.grbl_controller is not None:
             self.machine_timer.stop()
             self._save_machine_state()
@@ -3310,24 +3639,13 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.machine_info_label.setText("No controller identified")
             self._console_log("Disconnected.")
             self._set_machine_controls()
-            return
 
-        port = self.port_combo.currentData()
-        if not port:
-            self.machine_status_label.setText("Select an available serial port first.")
-            return
-        answer = QMessageBox.question(
-            self,
-            "Connect to GRBL controller",
-            "Only GRBL 1.1-compatible controllers are supported. Opening a serial port can reset some controllers.\n\n"
-            "Confirm the machine is clear, the emergency stop is accessible, and the selected port is correct.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
+    def _open_controller(self, port: str, baud_text: str) -> bool:
+        """Open the port (the owner already confirmed) and start identifying the firmware."""
         try:
-            baudrate = int(self.baud_combo.currentText())
+            baudrate = self._resolve_baud(port, baud_text)
+            if baudrate is None:
+                return False
             self.grbl_controller = GrblController(str(port), baudrate)
             self.grbl_identification_lines.clear()
             self.grbl_capabilities = None
@@ -3337,12 +3655,22 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.position_verified_box.setChecked(False)
             self.preflight_complete = False
             self._preflight_pending = True  # preflight repeats after every (re)connect
-            self.grbl_controller.send_line("$I")
-            self.grbl_controller.send_line("$$")  # read-only: axis maximum rates $110-$112 for the multiplier clamp
-            self.grbl_controller.send_realtime(b"?")
+            # v3 Block 7: wait for the boot banner, then $I / $$ / ? (a board that resets on open loses
+            # anything sent at once); $$ is read-only: rates for the multiplier clamp, $5/$21/$22.
+            now = self._clock()
+            boot_wait = float(getattr(self.current_machine, "boot_wait_s", 3.0) or 3.0) if self.current_machine else 3.0
+            self.handshake = Handshake(baud=baudrate, boot_wait_s=boot_wait)
+            self.handshake.start(now)
+            self._handshake_reported = False
+            self._connected_at = now
+            self._last_status_at = now
+            self._not_responding = False
+            self._limit_diag_shown = ""
+            self._set_diagnostic("")
+            self.grbl_settings = {}
             self.machine_poll_ticks = 0
-            self.machine_status_label.setText(f"Connected to {port} · identifying GRBL firmware…")
-            self._console_log(f"Connected to {port} at {baudrate} baud; sent $I and status query.")
+            self.machine_status_label.setText(f"Connected to {port} · waiting for the controller to start")
+            self._console_log(f"Opened {port} at {baudrate} baud; waiting for the controller's start-up message.")
             self.machine_timer.start()
         except Exception as error:
             if self.grbl_controller is not None:
@@ -3350,15 +3678,176 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.grbl_controller = None
             self._critical_box(self, "Controller connection failed", str(error))
         self._set_machine_controls()
+        return self.grbl_controller is not None
+
+    def _resolve_baud(self, port: str, baud_text: str) -> int | None:
+        """A baud rate from the combo; "Auto" scans the common rates first (v3 Blocks 6-7)."""
+        text = str(baud_text or "").strip()
+        if text.casefold() != "auto":
+            return int(text or 115200)
+        from basicam.grbl_handshake import scan_baud_rates
+        from basicam.machine_profiles import BAUD_RATES
+
+        self._console_log(f"Auto baud: trying {', '.join(BAUD_RATES)} on {port}...")
+        result = self._run_blocking(lambda wait: scan_baud_rates(port, BAUD_RATES, wait=wait))
+        if not result.ok:
+            self._critical_box(self, "Auto baud", result.message)
+            return None
+        self._console_log(f"Auto baud: {port} answers at {result.baud} baud.")
+        if self.baud_combo.findText(str(result.baud)) < 0:
+            self.baud_combo.addItem(str(result.baud))
+        self.baud_combo.setCurrentText(str(result.baud))
+        if self.current_machine is not None and self.current_machine.port in ("", port):
+            self.current_machine.port, self.current_machine.baud = port, int(result.baud)
+            self.machine_store.save(self.current_machine)
+        return int(result.baud)
+
+    def _run_blocking(self, job):
+        """Run a short serial job (a few seconds) while keeping the window responsive."""
+        import time as _time
+
+        def wait(seconds: float) -> None:
+            QApplication.processEvents()
+            _time.sleep(min(max(seconds, 0.0), 0.05))
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return job(wait)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    # ------------------------------------------------------------ Machine menu (v3 Block 6)
+    def open_machine_inventory(self) -> None:
+        self.open_tool_library(tab="Machines")
+
+    def load_last_machine(self) -> bool:
+        machine_id = self.settings.value("machines/last", "") or self.machine_store.default_id
+        machine = self.machine_store.get(machine_id) if machine_id else None
+        if machine is None:
+            QMessageBox.information(self, "Load last machine", "No machine has been loaded yet; add one in Machine > Machine inventory.")
+            return False
+        self._set_current_machine(machine.machine_id)
+        self.statusBar().showMessage(f"Loaded {machine.name}", 4000)
+        return True
+
+    def show_manual_controller(self) -> None:
+        self.machine_dock.show()
+        self.machine_dock.raise_()
+        tabs = getattr(self, "machine_tabs", None)
+        if tabs is not None:
+            index = next((i for i in range(tabs.count()) if tabs.tabText(i) == "Machine"), 0)
+            tabs.setCurrentIndex(index)
+
+    def open_ports_dialog(self):
+        from basicam.ports_dialog import PortsDialog
+
+        def connect(device: str, baud: str) -> None:
+            if self.grbl_controller is not None:
+                QMessageBox.information(self, "Connect", f"Disconnect from {self._connected_port()} first.")
+                return
+            if not self._confirm_connect():
+                return
+            self._refresh_machine_ports()
+            index = self.port_combo.findData(device)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
+            self._open_controller(device, baud)
+
+        def use(device: str, baud: str) -> str:
+            if self.current_machine is None:
+                return "Load a machine first (Machine > Machine inventory)."
+            self.current_machine.port = device
+            if baud.casefold() != "auto":
+                self.current_machine.baud = int(baud)
+            self.machine_store.save(self.current_machine)
+            return f"{self.current_machine.name} now uses {device}."
+
+        dialog = PortsDialog(
+            self, in_use=lambda device: bool(device) and self._connected_port() == device,
+            test=lambda device, baud: self.test_connection(device, baud, show=False),
+            connect=connect, use_for_machine=use, baud=self.baud_combo.currentText(),
+        )
+        self.ports_dialog = dialog
+        dialog.show()
+        return dialog
+
+    def test_connection(self, port: str | None = None, baud: str | None = None, show: bool = True) -> str:
+        """Machine > Test connection: firmware, version, options, axes, state, pins and round trip.
+        Never sends motion. An open connection is only asked for a status report."""
+        from basicam.grbl_handshake import probe_controller, scan_baud_rates
+        from basicam.machine_profiles import BAUD_RATES
+
+        if self.grbl_controller is not None and (port is None or port == self._connected_port()):
+            try:
+                self.grbl_controller.send_realtime(b"?")
+            except Exception as error:  # noqa: BLE001
+                text = f"Status query failed: {error}"
+            else:
+                caps = self.grbl_capabilities
+                status = self.grbl_status
+                text = "\n".join([
+                    f"Connected to {self._connected_port()} at {self.baud_combo.currentText()} baud.",
+                    f"Firmware: {caps.version if caps else 'not identified yet'}",
+                    f"Options: {caps.options if caps and caps.options else '-'}",
+                    f"Axes: {caps.axes if caps else '-'}",
+                    f"State: {status.state if status else 'no status report yet'}",
+                    f"Limit / input pins: {(status.pins if status else '') or 'none active'}",
+                ])
+        else:
+            port = port or self.port_combo.currentData()
+            if not port:
+                text = "Select a serial port first (Machine > Ports...)."
+            else:
+                baud = baud or self.baud_combo.currentText()
+                if str(baud).casefold() == "auto":
+                    result = self._run_blocking(lambda wait: scan_baud_rates(str(port), BAUD_RATES, wait=wait))
+                else:
+                    result = self._run_blocking(lambda wait: probe_controller(str(port), int(baud), wait=wait))
+                text = f"{port}:\n" + result.summary()
+        for line in text.splitlines():
+            self.terminal_core.log("info", f"Test connection: {line}")
+        if show:
+            QMessageBox.information(self, "Test connection", text)
+        return text
+
+    def reset_connection(self) -> bool:
+        """Close the port and reconnect with the same settings; position must be verified again."""
+        if self.grbl_controller is None:
+            return False
+        port, baud = self._connected_port(), self.baud_combo.currentText()
+        answer = QMessageBox.question(
+            self, "Reset connection",
+            f"Close {port} and connect again? Opening the port can reset the controller; the position must be "
+            "verified and the preflight check repeated afterwards.\n\n"
+            "This is not the controller soft reset (Ctrl-X): that is Reset controller in the machine panel.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self._disconnect_controller()
+        return self._open_controller(port, baud)
 
     def _poll_machine(self) -> None:
         if self.grbl_controller is None:
             return
         try:
             self.machine_poll_ticks += 1
-            if self.machine_poll_ticks % 5 == 0:
+            hs = getattr(self, "handshake", None)
+            booting = hs is not None and hs.state in ("boot_wait", "query")
+            if self.machine_poll_ticks % 5 == 0 and not booting:
                 self.grbl_controller.send_realtime(b"?")
+            raw = self.grbl_controller.read_raw() if hasattr(self.grbl_controller, "read_raw") else b""
             lines = self.grbl_controller.read_lines()
+            if hs is not None and not hs.done:
+                for command in hs.feed(lines, raw) + hs.tick(self._clock()):
+                    if isinstance(command, bytes):
+                        self.grbl_controller.send_realtime(command)
+                    elif command == "":
+                        if hasattr(self.grbl_controller, "send_blank"):
+                            self.grbl_controller.send_blank()
+                    else:
+                        self.grbl_controller.send_line(command)
+                        self.terminal_core.log("command", command)
         except Exception as error:
             self._console_log(f"Serial error: {error}")
             self.machine_timer.stop()
@@ -3378,12 +3867,15 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             if line.startswith("$") and "=" in line:
                 self.grbl_settings.update(parse_grbl_settings([line]))
             self._stream_ack(line)
+            if not self._program_running():
+                self._ack_received(line)
             self.grbl_identification_lines.append(line)
             if len(self.grbl_identification_lines) > 100:
                 self.grbl_identification_lines = self.grbl_identification_lines[-100:]
             status = parse_grbl_status(line)
             if status is not None:
                 self.grbl_status = status
+                self._status_received(status)
                 if status.work_offset is not None:
                     self.last_wco = tuple(status.work_offset)
                 if status.state.casefold().startswith("alarm") and self.preflight_complete:
@@ -3399,7 +3891,11 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 elif status.state.casefold().startswith("alarm"):
                     self.position_verified = False
                     self.position_verified_box.setChecked(False)
+                    self._clear_user_position()
+                if status.state.casefold() == "idle":
+                    self._last_alarm_code = None
             elif line.upper().startswith("ALARM:"):
+                self._alarm_received(line)
                 self.grbl_status = GrblStatus(line)
                 self.preflight_complete = False
                 self._preflight_pending = True
@@ -3418,23 +3914,137 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                     f"The controller reports axes {reported}; {machine.name} needs {', '.join(missing)}. "
                     "Motion is refused until the controller and the machine profile match.",
                 )
+            self._axes_match = not missing
             if missing:
                 self.preflight_complete = False
                 self._preflight_pending = False
-        identified = self.grbl_capabilities is not None and self.grbl_capabilities.version.startswith("1.1")
-        state = self.grbl_status.state.casefold() if self.grbl_status is not None else ""
-        if identified and getattr(self, "_preflight_pending", False) and not state.startswith("alarm"):
-            self._preflight_pending = False
-            self._start_preflight()
+        identified = self.grbl_capabilities is not None
+        self._handshake_progress()
+        self._check_controller_health()
+        self._check_missing_ok()
+        if identified:
+            self._maybe_start_preflight()  # once the position is verified (v3 Block 8)
         self._set_machine_controls()
+
+    # ------------------------------------------------------------ connection health and diagnostics (v3 Block 7)
+    def _clock(self) -> float:
+        return time.monotonic()
+
+    def _handshake_progress(self) -> None:
+        hs = getattr(self, "handshake", None)
+        if hs is None or getattr(self, "_handshake_reported", True):
+            return
+        if hs.state == "failed":
+            self._handshake_reported = True
+            for line in hs.message.splitlines():
+                self.terminal_core.log("error", line)
+            first = hs.message.splitlines()[0] if hs.message else "No GRBL reply."
+            self._set_diagnostic(f"{first} Details are in the terminal; check the port and baud rate.")
+            self.statusBar().showMessage("No GRBL reply - see the terminal", 8000)
+        elif self.grbl_capabilities is not None:
+            self._handshake_reported = True
+            caps = self.grbl_capabilities
+            self.terminal_core.log("info", f"Identified {getattr(caps, 'firmware_name', 'GRBL')} {caps.version} (axes {caps.axes}).")
+
+    def _status_received(self, status) -> None:
+        self._last_status_at = self._clock()
+        if getattr(self, "_not_responding", False):
+            self._not_responding = False
+            self.terminal_core.log("info", "The controller is responding again. Verify the position before moving.")
+            self._set_diagnostic("")
+        self._update_pins(status.pins)
+        axes = self.grbl_capabilities.axes if self.grbl_capabilities is not None else "XYZ"
+        state = status.state.casefold()
+        if (state == "idle" or state.startswith("alarm")) and not self._program_running():
+            text = limit_diagnostic(status.pins, axes, self.grbl_settings) if all_limits_active(status.pins, axes) else ""
+            if text or not state.startswith("alarm"):  # an alarm-after-reset note stays while in alarm
+                self._show_limit_diagnostic(text)
+        dialog = getattr(self, "limit_test_dialog", None)
+        if dialog is not None and dialog.isVisible():
+            dialog.update_pins(status.pins)
+
+    def _alarm_received(self, line: str) -> None:
+        code = line.partition(":")[2].strip()
+        self._last_alarm_code = int(code) if code.isdigit() else None
+        self._clear_user_position()
+        since = self._clock() - getattr(self, "_connected_at", -1e9)
+        if code == "1" and since < 5.0 and not self._program_running():
+            pins = self.grbl_status.pins if self.grbl_status is not None else ""
+            axes = self.grbl_capabilities.axes if self.grbl_capabilities is not None else "XYZ"
+            self._show_limit_diagnostic(limit_diagnostic(pins, axes, self.grbl_settings, alarm_after_reset=True))
+
+    def _show_limit_diagnostic(self, text: str) -> None:
+        if not text:
+            if getattr(self, "_limit_diag_shown", ""):  # inputs read normal again
+                self._limit_diag_shown = ""
+                self._set_diagnostic("")
+            return
+        if text == getattr(self, "_limit_diag_shown", ""):
+            return
+        self._limit_diag_shown = text
+        for line in text.splitlines():
+            self.terminal_core.log("warning", line)
+        self._set_diagnostic(text.splitlines()[0] + " Run the limit-switch test.")
+
+    def _set_diagnostic(self, text: str) -> None:
+        if hasattr(self, "machine_diag_label"):
+            self.machine_diag_label.setText(text)
+            self.machine_diag_label.setVisible(bool(text))
+
+    def _update_pins(self, pins: str) -> None:
+        if not hasattr(self, "pins_label"):
+            return
+        names = describe_pins(pins)
+        self.pins_label.setText("Inputs: " + (", ".join(names) if names else "none active"))
+        color = theme_color("warning") if names else theme_color("muted")
+        self.pins_label.setStyleSheet(f"color: {color};")
+
+    def _check_controller_health(self) -> None:
+        """No status report for 5 s while connected: say so, hold any stream, position unverified."""
+        hs = getattr(self, "handshake", None)
+        if self.grbl_controller is None or self.grbl_capabilities is None or (hs is not None and not hs.done):
+            return
+        if getattr(self, "_not_responding", False):
+            return
+        if self._clock() - getattr(self, "_last_status_at", self._clock()) <= 5.0:
+            return
+        self._not_responding = True
+        self.terminal_core.log("error", "Controller not responding: no status report for 5 s.")
+        self._set_diagnostic("Controller not responding. Check the cable and power, then Reset connection.")
+        if self._program_running():
+            self.stop_program_stream()
+        self.position_verified = False
+        self.position_verified_box.setChecked(False)
+
+    def open_limit_switch_test(self):
+        from basicam.limit_test import LimitSwitchTestDialog
+
+        caps = self.grbl_capabilities
+        if self.grbl_controller is None or caps is None:
+            QMessageBox.information(self, "Limit-switch test", "Connect to the controller first.")
+            return None
+        state = self.grbl_status.state.casefold() if self.grbl_status is not None else ""
+        if self._program_running() or state in ("run", "jog", "home"):
+            QMessageBox.information(self, "Limit-switch test", "Stop the machine first; the test needs it standing still.")
+            return None
+
+        def send_setting(line: str) -> None:
+            # the only place BasiCAM writes $5 (roadmap v3 decision 1); never $20 / $21
+            self._send_machine_line(line)
+            self.grbl_controller.send_line("$$")
+
+        dialog = LimitSwitchTestDialog(self, axes=caps.axes or "XYZ", settings=self.grbl_settings,
+                                       firmware=getattr(caps, "firmware", "grbl"), send_setting=send_setting)
+        self.limit_test_dialog = dialog
+        if self.grbl_status is not None:
+            dialog.update_pins(self.grbl_status.pins)
+        dialog.show()
+        return dialog
 
     def _set_machine_controls(self) -> None:
         connected = self.grbl_controller is not None
-        identified = bool(
-            connected
-            and self.grbl_capabilities is not None
-            and self.grbl_capabilities.version.startswith("1.1")
-        )
+        # GRBL 1.1, grblHAL and FluidNC are identified the same way (v3 Block 7)
+        identified = bool(connected and self.grbl_capabilities is not None)
         state = self.grbl_status.state if self.grbl_status is not None else "Unknown"
         controller_idle = identified and state.casefold() == "idle"
         idle = controller_idle and self.position_verified
@@ -3443,17 +4053,41 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         # The console stays usable without a machine (help/status); sending is refused by the validator.
         self.console_input.setEnabled(True)
         self.console_send_button.setEnabled(True)
-        motion_ok = bool(idle and self.preflight_complete)
-        for label, button in self.jog_buttons.items():
-            button.setEnabled(bool(motion_ok and label[0] in axes))
-        self.home_button.setEnabled(bool(controller_idle))
-        self.position_verified_box.setEnabled(bool(controller_idle))
-        self.unlock_button.setEnabled(bool(identified and state.casefold().startswith("alarm")))
-        self.hold_button.setEnabled(bool(identified and state.casefold() in {"run", "jog", "home"}))
-        self.resume_button.setEnabled(bool(identified and state.casefold().startswith("hold")))
+        # v3 Block 8: every control asks the one readiness gate; a disabled control says why.
+        jog = self.readiness("jog")
+        motion_ok = jog.allowed
+        if identified:
+            self.jog_pad.set_extra_axes(axes)
+        self.jog_pad.set_enabled_state(motion_ok, axes, "" if motion_ok else self._why(jog), connected=connected)
+        dialog = getattr(self, "_preflight_dialog", None)
+        if dialog is not None and _alive(dialog):
+            status = self.grbl_status
+            positions = {}
+            if status is not None and status.machine_position:
+                positions = dict(zip("XYZ", status.machine_position[:3]))
+                positions.update({n: v for n, v in (getattr(status, "axis_values", ()) or ()) if n not in "XYZ"})
+            dialog.update_status(positions, status.pins if status is not None else "", {
+                "home": self.readiness("home").allowed, "unlock": self.readiness("unlock").allowed,
+                "hold": self.readiness("hold").allowed, "kill": connected,
+            })
+        for pad in [p for p in getattr(self, "extra_pads", []) if _alive(p)]:
+            gate = self.readiness("preflight_jog") if getattr(pad, "preflight", False) else jog
+            if identified:
+                pad.set_extra_axes(axes)
+            pad.set_enabled_state(gate.allowed, axes, "" if gate.allowed else self._why(gate), connected=connected)
+        if hasattr(self, "main_kill_button"):
+            self.main_kill_button.setEnabled(bool(connected))
+        for button, action in ((self.home_button, "home"), (self.unlock_button, "unlock"), (self.hold_button, "hold"),
+                               (self.resume_button, "resume"), (self.spindle_start_button, "spindle")):
+            result = self.readiness(action)
+            button.setEnabled(result.allowed)
+            button.setToolTip("" if result.allowed else self._why(result))
+        verify = self.readiness("verify")
+        self.position_verified_box.setEnabled(verify.allowed or self.position_verified)
         self.kill_button.setEnabled(bool(connected))
         self.reset_controller_button.setEnabled(bool(connected))
-        self.spindle_start_button.setEnabled(motion_ok)
+        self._set_machine_menu_state(connected, identified, state, motion_ok, axes, controller_idle)
+        self._refresh_ready_checklist()
         self.spindle_stop_button.setEnabled(bool(idle or state.casefold() in {"run", "jog"}))
 
         self._update_status_indicator(connected, identified, state)
@@ -3461,12 +4095,14 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.machine_status_label.setText("Disconnected · GRBL-compatible controllers only")
             self.machine_badge.setText("●  SIMULATION ONLY")
         elif not identified:
-            self.machine_status_label.setText("Serial connected · waiting for a GRBL firmware response")
+            hs = getattr(self, "handshake", None)
+            text = hs.status_text(self._clock()) if hs is not None else "waiting for a GRBL firmware response"
+            self.machine_status_label.setText(f"Serial connected · {text}")
             self.machine_badge.setText("●  IDENTIFYING")
         else:
             position_state = "position verified" if self.position_verified else "home/verify position to enable motion"
             self.machine_status_label.setText(
-                f"GRBL {self.grbl_capabilities.version} · {state} · {position_state}"
+                f"{getattr(self.grbl_capabilities, 'firmware_name', 'GRBL')} {self.grbl_capabilities.version} · {state} · {position_state}"
             )
             self.machine_badge.setText("●  GRBL CONNECTED")
         if identified:
@@ -3501,7 +4137,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
 
     def _record_fault(self, line: str) -> str | None:
         """GRBL alarm/error: timestamped log line, kept for the status indicator."""
-        description = describe_grbl_message(line)
+        caps = getattr(self, "grbl_capabilities", None)
+        description = describe_grbl_message(line, getattr(caps, "firmware", "grbl") if caps is not None else "grbl")
         if description is None:
             return None
         stamp = time.strftime("%H:%M:%S")
@@ -3511,6 +4148,27 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         if hasattr(self, "machine_state_indicator"):
             self.machine_state_indicator.setToolTip(f"Last fault at {stamp}: {description}")
         return description
+
+    def _set_machine_menu_state(self, connected, identified, state, motion_ok, axes, controller_idle) -> None:
+        """Machine-communication commands need a connected, identified controller (v3 Block 6)."""
+        actions = getattr(self, "command_actions", {})
+        lowered = str(state).casefold()
+        rules = {
+            "machine_home": self.readiness("home").allowed,
+            "machine_hold": self.readiness("hold").allowed,
+            "machine_resume": self.readiness("resume").allowed,
+            "machine_reset_connection": bool(connected),
+            "machine_test": bool(connected or (hasattr(self, "port_combo") and self.port_combo.currentData())),
+        }
+        for axis in "XYZ":
+            for suffix in ("m", "p"):
+                rules[f"machine_jog_{axis.lower()}{suffix}"] = bool(motion_ok and axis in axes)
+        for name, enabled in rules.items():
+            action = actions.get(name)
+            if action is not None:
+                action.setEnabled(enabled)
+        if getattr(self, "connect_action", None) is not None:
+            self.connect_action.setText("Disconnect" if connected else "Connect")
 
     def _update_status_indicator(self, connected: bool, identified: bool, state: str) -> None:
         if not hasattr(self, "machine_state_indicator"):
@@ -3660,22 +4318,256 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self._send_machine_line(command)
         view.clear_input()
 
-    def _jog_axis(self, axis: str, sign: int) -> None:
-        if self.grbl_controller is None or self.grbl_status is None or self.grbl_status.state.casefold() != "idle":
-            return
-        if not self.preflight_complete:
-            self.terminal_core.log("warning", "Jog refused: finish the preflight check first.")
-            return
+    def _jog_axis(self, axis: str, sign: int, preflight: bool = False, distance: float | None = None,
+                  feed: float | None = None) -> bool:
+        """One guarded jog. Refusals are never silent: the reason goes to the terminal and status bar."""
+        result = self.readiness("preflight_jog" if preflight else "jog")
+        if not result.allowed:
+            self._refuse(result, "Jog")
+            return False
+        axis = axis.upper()
+        axes = self.grbl_capabilities.axes if self.grbl_capabilities is not None else "XYZ"
+        if axis not in axes:
+            self._refuse(readiness_rules.Readiness(False, f"The controller has no {axis} axis.", ""), "Jog")
+            return False
+        step = self.jog_pad.increment_mm(axis) if hasattr(self, "jog_pad") else self.jog_distance.value()
+        distance = (step if distance is None else abs(float(distance))) * sign
+        if feed is None:
+            feed = self.jog_pad.feed_for({axis: sign}) if hasattr(self, "jog_pad") else self.jog_feed.value()
+        return self._jog_moves({axis: distance}, float(feed), preflight=preflight, checked=True)
+
+    def _jog_moves(self, moves: dict, feed: float, preflight: bool = False, checked: bool = False) -> bool:
+        """Guarded jog of one or more axes together (pad diagonals); refusals show their reason."""
+        if not checked:
+            result = self.readiness("preflight_jog" if preflight else "jog")
+            if not result.allowed:
+                self._refuse(result, "Jog")
+                return False
+        axes = self.grbl_capabilities.axes if self.grbl_capabilities is not None else "XYZ"
+        missing = [a for a in moves if a.upper() not in axes]
+        if missing:
+            self._refuse(readiness_rules.Readiness(False, f"The controller has no {', '.join(missing)} axis.", ""), "Jog")
+            return False
         try:
-            distance = self.jog_distance.value() * sign
-            feed = self.jog_feed.value()
-            if not self.motion_guard.report(self.motion_guard.check_jog(axis, distance), "Jog"):
-                return
-            self.grbl_controller.jog(axis, distance, feed)
-            self._record_relative_move(axis, distance)
-            self._console_log(f"> $J=G91 G21 {axis}{distance:.4f} F{feed:.1f}")
+            moves = {a.upper(): float(d) for a, d in moves.items() if abs(float(d)) > 0}
+            if not self.motion_guard.report(self.motion_guard.check_jog_moves(moves), "Jog"):
+                if hasattr(self, "jog_pad"):
+                    self.jog_pad.show_refusal("Refused by the motion guard; see the terminal.")
+                return False
+            if len(moves) == 1:
+                axis, distance = next(iter(moves.items()))
+                self.grbl_controller.jog(axis, distance, feed, axes=axes, max_distance=self._jog_cap(axis))
+            else:
+                self.grbl_controller.jog_multi(moves, feed, axes=axes, caps={a: self._jog_cap(a) for a in moves})
+            words = " ".join(f"{a}{d:.4f}" for a, d in moves.items())
+            self._expect_ok(f"$J {words}")
+            for axis, distance in moves.items():
+                if axis in "XYZ":
+                    self._record_relative_move(axis, distance)
+                dialog = getattr(self, "_preflight_dialog", None)
+                if preflight and dialog is not None and _alive(dialog):
+                    dialog.note_move(axis, 1 if distance > 0 else -1)
+            self._console_log(f"> $J=G91 G21 {words} F{feed:.1f}")
+            if hasattr(self, "jog_pad"):
+                self.jog_pad.show_refusal("")
+            return True
         except Exception as error:
             self._console_log(f"Jog rejected: {error}")
+            return False
+
+    def make_jog_pad(self) -> JogPad:
+        """Another jog pad (preflight, soft-limit wizard): same guarded jogs, KILL and settings."""
+        pad = JogPad(
+            jog=lambda moves, feed: self._jog_moves(moves, feed, preflight=getattr(pad, "preflight", False)),
+            kill=self._kill_machine,
+            go_to_zero=self.go_to_work_zero_xy,
+            jog_hold=lambda axis, sign, feed: self._jog_hold(axis, sign, feed, preflight=getattr(pad, "preflight", False)),
+            jog_cancel=self._jog_cancel,
+            parse=lambda text: parse_length_to_mm(text, 25.4 if self.units.display is LengthUnit.INCHES else 1.0),
+            inches=self.units.display is LengthUnit.INCHES,
+        )
+        pad.apply_state(self.jog_pad.state())
+        self.extra_pads = [p for p in getattr(self, "extra_pads", []) if _alive(p)] + [pad]
+        self._set_machine_controls()
+        return pad
+
+    def _jog_hold(self, axis: str, sign: int, feed: float, preflight: bool = False) -> bool:
+        """Hold to move: one jog to the farthest target the guard accepts; release sends jog cancel."""
+        result = self.readiness("preflight_jog" if preflight else "jog")
+        if not result.allowed:
+            self._refuse(result, "Jog")
+            return False
+        distance = self._jog_cap(axis)
+        floor = self.jog_pad.increment_mm(axis) if hasattr(self, "jog_pad") else 1.0
+        while distance >= floor:
+            if not self.motion_guard.check_jog_moves({axis: sign * distance}):
+                return self._jog_moves({axis: sign * distance}, feed, preflight=preflight, checked=True)
+            distance /= 2.0
+        self._refuse(readiness_rules.Readiness(False, f"No room to move {axis}{'+' if sign > 0 else '−'}.", ""), "Jog")
+        return False
+
+    def _jog_cancel(self) -> None:
+        if self.grbl_controller is not None:
+            try:
+                self.grbl_controller.send_realtime(b"\x85")
+                self.terminal_core.log("command", "Jog cancel (0x85)")
+            except Exception as error:  # noqa: BLE001
+                self.terminal_core.log("error", f"Jog cancel failed: {error}")
+
+    def go_to_work_zero_xy(self) -> bool:
+        """Pad centre: Z up to a safe height, then X0 Y0 in work coordinates (asks; guarded)."""
+        result = self.readiness("jog")
+        if not result.allowed:
+            self._refuse(result, "Go to work zero")
+            return False
+        if self.last_wco is None or self.current_machine is None:
+            self._refuse(readiness_rules.Readiness(False, "The work zero is not known yet.", "Zero work"), "Go to work zero")
+            return False
+        safe_z = self.current_machine.hard_bounds("Z")[1] - 2.0
+        lines = [f"G53 G0 Z{safe_z:.3f}", "G90 G0 X0 Y0"]
+        answer = QMessageBox.question(
+            self, "Go to work zero", "Raise Z to a safe height, then move to work X0 Y0?\n\n" + "\n".join(lines),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        from basicam.motion_guard import GuardState
+
+        wco = tuple(float(v) for v in self.last_wco)
+        start = GuardState(position=self.motion_guard.position(), work_offsets={"G54": wco})
+        violations = self.motion_guard.check_program_text("\n".join(lines), start=start)
+        if not self.motion_guard.report(violations, "Go to work zero"):
+            return False
+        for line in lines:
+            self._send_machine_line(line)
+            self._expect_ok(line)
+        return True
+
+    def _jog_cap(self, axis: str) -> float:
+        """Largest single jog: the axis travel from the machine profile (the guard checks every target)."""
+        machine = self.current_machine
+        if machine is not None:
+            spec = next((a for a in machine.axis_specs() if a.name == axis), None)
+            if spec is not None:
+                if getattr(spec, "kind", "linear") == "rotary":
+                    return 360.0
+                return max(abs(float(spec.maximum) - float(spec.minimum)), 1.0)
+        return 25.0
+
+    # ------------------------------------------------------------ readiness gate (v3 Block 8)
+    def _readiness_context(self) -> readiness_rules.ReadinessContext:
+        caps = self.grbl_capabilities
+        status = self.grbl_status
+        state = status.state if status is not None else ""
+        machine = self.current_machine
+        has_switches = bool(getattr(machine, "has_homing_switches", True)) if machine is not None else True
+        homing_enabled = bool(self.grbl_settings.get(22, 1.0)) if 22 in self.grbl_settings else has_switches
+        axes = caps.axes if caps is not None else "XYZ"
+        lowered = state.casefold()
+        at_rest = lowered == "idle" or lowered.startswith("alarm")
+        hs = getattr(self, "handshake", None)
+        return readiness_rules.ReadinessContext(
+            connected=self.grbl_controller is not None,
+            identified=caps is not None,
+            firmware=getattr(caps, "firmware", "grbl") if caps is not None else "grbl",
+            state=state.split(":")[0] if lowered.startswith("alarm") else state,
+            alarm_code=getattr(self, "_last_alarm_code", None),
+            position_verified=bool(self.position_verified),
+            preflight_complete=bool(self.preflight_complete),
+            program_running=bool(self._program_running()),
+            homing_enabled=homing_enabled,
+            has_homing_switches=has_switches,
+            limit_pins_active=bool(at_rest and status is not None and all_limits_active(status.pins, axes)),
+            axes_match=bool(getattr(self, "_axes_match", True)),
+            handshake_failed=bool(hs is not None and hs.state == "failed"),
+        )
+
+    def readiness(self, action: str) -> readiness_rules.Readiness:
+        return readiness_rules.machine_readiness(action, self._readiness_context())
+
+    @staticmethod
+    def _why(result) -> str:
+        return result.reason + (f" Next: {result.next_step}." if result.next_step else "")
+
+    def _refuse(self, result, title: str) -> None:
+        text = f"{title} refused: {self._why(result)}"
+        self.terminal_core.log("warning", text)
+        self.statusBar().showMessage(text, 6000)
+
+    def _build_ready_checklist(self, layout) -> None:
+        box = QGroupBox("Ready checklist")
+        grid = QGridLayout(box)
+        grid.setContentsMargins(6, 4, 6, 4)
+        self.checklist_rows: dict[str, tuple[QLabel, QPushButton]] = {}
+        for row, (key, label) in enumerate(readiness_rules.CHECKLIST):
+            text = QLabel(f"○  {label}")
+            button = QPushButton("")
+            button.setAutoDefault(False)
+            button.clicked.connect(lambda *_a, k=key: self._checklist_action(k))
+            grid.addWidget(text, row, 0)
+            grid.addWidget(button, row, 1)
+            self.checklist_rows[key] = (text, button)
+        self.ready_checklist = box
+        layout.addWidget(box)
+
+    def _refresh_ready_checklist(self) -> None:
+        rows = getattr(self, "checklist_rows", None)
+        if not rows:
+            return
+        items = readiness_rules.checklist(self._readiness_context())
+        nxt = readiness_rules.first_unmet(items)
+        self._checklist_actions = {key: action for key, _l, _d, action in items}
+        for key, label, done, action in items:
+            text, button = rows[key]
+            mark = "✓" if done else ("➜" if key == nxt else "○")
+            text.setText(f"{mark}  {label}")
+            colour = theme_color("ok") if done else (theme_color("accent") if key == nxt else theme_color("muted"))
+            text.setStyleSheet(f"color: {colour};" + (" font-weight: 700;" if key == nxt else ""))
+            button.setText(action)
+            button.setVisible(bool(action) and not done and key == nxt)
+        if nxt is not None and self.grbl_controller is not None:
+            result = self.readiness("jog")
+            if not result.allowed:
+                self.machine_status_label.setToolTip(self._why(result))
+
+    def _checklist_action(self, key: str) -> None:
+        action = getattr(self, "_checklist_actions", {}).get(key, "")
+        handlers = {
+            "Connect": self._toggle_machine_connection,
+            "Test connection": lambda: self.test_connection(),
+            "Unlock": self._unlock_machine,
+            "Home": self._home_machine,
+            "Verify position": lambda: self.position_verified_box.setChecked(True),
+            "Run preflight": self._start_preflight,
+            "Limit-switch test": self.open_limit_switch_test,
+        }
+        handler = handlers.get(action)
+        if handler is not None:
+            handler()
+
+    def _maybe_start_preflight(self) -> None:
+        """Preflight starts once the position is verified (and again after any alarm)."""
+        if getattr(self, "_preflight_pending", False) and self.readiness("preflight").allowed:
+            self._preflight_pending = False
+            self._start_preflight()
+
+    def _expect_ok(self, command: str) -> None:
+        self._await_ok = (getattr(self, "_await_ok", []) + [(command, self._clock())])[-20:]
+
+    def _ack_received(self, line: str) -> None:
+        pending = getattr(self, "_await_ok", [])
+        if pending and (line == "ok" or line.lower().startswith("error")):
+            pending.pop(0)
+
+    def _check_missing_ok(self) -> None:
+        pending = getattr(self, "_await_ok", [])
+        if not pending or self._program_running():
+            return
+        state = self.grbl_status.state.casefold() if self.grbl_status is not None else ""
+        command, sent_at = pending[0]
+        if state == "idle" and self._clock() - sent_at > 2.0:
+            pending.pop(0)
+            self.terminal_core.log("warning", f"No reply ('ok') to {command} within 2 s; check the terminal.")
 
     # ------------------------------------------------------------ Advanced G-code mode (Block 12)
     def _advanced_gcode_allowed(self) -> bool:
@@ -3875,7 +4767,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         mods = event.modifiers()
         control = self.keyboard_control
         control.inches = self.units.display is LengthUnit.INCHES
-        control.jog_feed = self.jog_feed.value()
+        control.step_for = self.jog_pad.increment_mm  # v3 Block 9: the pad's per-axis increments
+        control.jog_feed = self.jog_pad.feed_for({"X": 1})
         control.cut_feed = self.feed.value() if hasattr(self, "feed") else control.cut_feed
         control.spindle_on = bool(self.grbl_status and self.grbl_status.spindle_rpm)
         result = control.handle(
@@ -3973,8 +4866,18 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             if self.grbl_controller is None:
                 self.terminal_core.log("warning", "No machine connected; nothing was sent.")
                 return False
+            preflighting = getattr(self, "_preflight_dialog", None) is not None and _alive(self._preflight_dialog) \
+                and self._preflight_dialog.isVisible()
+            ready = self.readiness("preflight_jog" if preflighting else "jog")  # same gate as the pad (v3 Blocks 8, 10)
+            if not ready.allowed:
+                self._refuse(ready, "Keyboard move")
+                return False
             try:
-                self.grbl_controller.jog(request.axis, request.distance, request.feed)
+                axes = self.grbl_capabilities.axes if self.grbl_capabilities is not None else "XYZ"
+                self.grbl_controller.jog(request.axis, request.distance, request.feed, axes=axes,
+                                         max_distance=self._jog_cap(request.axis))
+                if preflighting:
+                    self._preflight_dialog.note_move(request.axis, 1 if request.distance > 0 else -1)
             except Exception as error:
                 self.terminal_core.log("error", f"Keyboard move rejected: {error}")
                 return False
@@ -4009,6 +4912,10 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self._console_log(f"Controller error: {error}")
 
     def _home_machine(self) -> None:
+        result = self.readiness("home")
+        if not result.allowed:
+            self._refuse(result, "Home")
+            return
         answer = QMessageBox.warning(
             self,
             "Home machine",
@@ -4021,6 +4928,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.position_verified = False
             self.position_verified_box.setChecked(False)
             self._send_machine_line("$H")
+            self._expect_ok("$H")
             self._set_machine_controls()
 
     def _set_position_verified(self, checked: bool) -> None:
@@ -4028,10 +4936,22 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.position_verified = False
             self._set_machine_controls()
             return
-        if self.grbl_capabilities is None or self.grbl_status is None or self.grbl_status.state.casefold() != "idle":
+        result = self.readiness("verify")
+        if not result.allowed:
+            self._refuse(result, "Verify position")
             self.position_verified_box.blockSignals(True)
             self.position_verified_box.setChecked(False)
             self.position_verified_box.blockSignals(False)
+            return
+        machine = self.current_machine
+        if machine is not None and not getattr(machine, "has_homing_switches", True):
+            ok = self.verify_position_without_switches()
+            if not ok:
+                self.position_verified_box.blockSignals(True)
+                self.position_verified_box.setChecked(False)
+                self.position_verified_box.blockSignals(False)
+            self._set_machine_controls()
+            self._maybe_start_preflight()
             return
         answer = QMessageBox.question(
             self,
@@ -4047,8 +4967,58 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.position_verified_box.setChecked(False)
             self.position_verified_box.blockSignals(False)
         self._set_machine_controls()
+        self._maybe_start_preflight()
+
+    def verify_position_without_switches(self, choice: str | None = None, typed=None) -> bool:
+        """No homing switches: the owner says where the tool is; the guard then places the hard-limit
+        envelope with a user position offset (cleared on reset, alarm and disconnect)."""
+        machine = self.current_machine
+        status = self.grbl_status
+        reported = tuple(status.machine_position[:3]) if status is not None and status.machine_position else (0.0, 0.0, 0.0)
+        corner = tuple((machine.hard_bounds(a)[1] if machine.homing_direction == "max" else machine.hard_bounds(a)[0])
+                       for a in "XYZ")
+        if choice is None:
+            options = ["At the machine's home corner", "At the work zero I set", "At machine coordinates I type"]
+            if self.last_wco is None:
+                options.remove("At the work zero I set")
+            choice, ok = QInputDialog.getItem(self, "Verify position", "Where is the tool now?", options, 0, False)
+            if not ok:
+                return False
+        if choice.startswith("At the machine's home corner"):
+            target = corner
+        elif choice.startswith("At the work zero"):
+            if self.last_wco is None:
+                return False
+            target = tuple(float(v) for v in self.last_wco)
+        else:
+            if typed is None:
+                values = []
+                for axis in "XYZ":
+                    value, ok = QInputDialog.getDouble(self, "Verify position", f"Machine {axis} (mm):", 0.0, -100000.0, 100000.0, 3)
+                    if not ok:
+                        return False
+                    values.append(value)
+                typed = values
+            target = tuple(float(v) for v in typed)
+        self.user_position_offset = tuple(target[i] - reported[i] for i in range(3))
+        self.position_verified = True
+        self.position_verified_box.blockSignals(True)
+        self.position_verified_box.setChecked(True)
+        self.position_verified_box.blockSignals(False)
+        self.terminal_core.log("info", f"Position set by you: machine X{target[0]:.3f} Y{target[1]:.3f} Z{target[2]:.3f}.")
+        self._update_dro_readout()
+        return True
+
+    def _clear_user_position(self) -> None:
+        if getattr(self, "user_position_offset", None) is not None:
+            self.user_position_offset = None
+            self.terminal_core.log("warning", "The position you set was cleared; verify it again before moving.")
 
     def _unlock_machine(self) -> None:
+        result = self.readiness("unlock")
+        if not result.allowed:
+            self._refuse(result, "Unlock")
+            return
         answer = QMessageBox.warning(
             self,
             "Unlock GRBL alarm",
@@ -4068,6 +5038,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             QMessageBox.StandardButton.Cancel,
         )
         if answer == QMessageBox.StandardButton.Yes:
+            self._clear_user_position()
             self.position_verified = False
             self.position_verified_box.setChecked(False)
             self._send_realtime(b"\x18", "Soft reset (Ctrl-X)")
@@ -4619,12 +5590,17 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
     def _show_key_bindings(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Key bindings")
+        make_working_window(dialog)
         form = QFormLayout(dialog)
         editors: dict[str, QKeySequenceEdit] = {}
         for name, action in self.command_actions.items():
             editor = QKeySequenceEdit(action.shortcut(), dialog)
             editors[name] = editor
-            form.addRow(action.text(), editor)
+            label = action.text()
+            if not self.command_available(name):
+                label += " (not available on this machine)"
+                editor.setEnabled(False)
+            form.addRow(label, editor)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -4643,6 +5619,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
     def _show_preferences(self) -> None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Preferences")
+        make_working_window(dialog)
         form = QFormLayout(dialog)
         display_mode = QComboBox()
         display_mode.addItems(
@@ -4697,6 +5674,10 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         snap_px.setValue(int(round(self._snap_radius_px())))
         snap_px.setToolTip("How close the cursor must be, on screen, to snap to a point, edge or vertex.")
         form.addRow("Sketch · snap radius", snap_px)
+        show_all_types = QCheckBox("Show options for all machine types")
+        show_all_types.setChecked(self._show_all_machine_options())
+        show_all_types.setToolTip("Show lathe, laser, rotary and other options even when the loaded machine cannot use them.")
+        form.addRow("Machine options", show_all_types)
         sheet_top = QCheckBox("Sheet and plate top at Z0")
         sheet_top.setChecked(self._sheet_top_at_z0())
         sheet_top.setToolTip("On: Z = 0 is the top of a sheet or plate (usual for laser, plasma and waterjet). Off: the bottom.")
@@ -4717,6 +5698,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.settings.setValue("import/part_gap_mm", float(part_gap.value()))
             self.settings.setValue("sketch/snap_radius_px", int(snap_px.value()))
             self.settings.setValue("stock/sheet_top_at_z0", sheet_top.isChecked())
+            self.settings.setValue("ui/show_all_machine_types", show_all_types.isChecked())
+            self._apply_machine_visibility()
             for token, value in pending_colours.items():
                 self.settings.setValue(f"colors/{token}", value)
             self._apply_theme()
@@ -6415,6 +7398,11 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         self.wrap_rotary = QCheckBox("Wrap on the rotary axis")
         self.wrap_rotary.setToolTip("Draw the sketch unwrapped (Y = distance around the stock); it is wrapped onto the round stock.")
         layout.addWidget(self.wrap_rotary)
+        self.operation_kind_note = QLabel("")
+        self.operation_kind_note.setObjectName("warningLabel")
+        self.operation_kind_note.setVisible(False)
+        layout.addWidget(self.operation_kind_note)
+        self.operation_kind.currentTextChanged.connect(self._update_operation_kind_note)
         self.operation_kind.currentTextChanged.connect(self._update_contour_fields)
         self._update_contour_fields(self.operation_kind.currentText())
         self.target_label = QLabel("Target: Whole part")
@@ -6666,6 +7654,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             return []
         job_name, part_name, material_name, keep_file_coordinates = meta
         self.project_name_label.setText(job_name)
+        self.settings.setValue("job/name", job_name)
         if self.stock_material.findText(material_name) >= 0:
             self.stock_material.setCurrentText(material_name)
         unit_factor = 25.4 if self.units.imported_as is LengthUnit.INCHES else 1.0
@@ -6946,6 +7935,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             self.apply_stock_spec(dialog.spec())
 
     def apply_stock_spec(self, spec: StockSpec) -> None:
+        QTimer.singleShot(0, self._apply_machine_visibility)  # sheet / plate stock shows nesting
         spec.top_at_z0 = self._sheet_top_at_z0()
         mesh = build_stock_mesh(spec)
         self._set_stock_geometry(f"Stock · {spec.kind}", mesh, None, imported=False)
@@ -7322,12 +8312,16 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             dx, dy, dz = mx - zx, my - zy, mz - zz
             self.tracked_work_pos = [dx, dy, dz]
             source = "MPos"
+            if getattr(self, "user_position_offset", None) is not None:
+                source = "position set by you"
         else:
             dx, dy, dz = self.tracked_work_pos
             source = "est"
         self.dro_label.setText(
             f"DRO ({source}) ΔX: {dx:+.3f}  ΔY: {dy:+.3f}  ΔZ: {dz:+.3f} mm"
         )
+        if hasattr(self, "jog_pad"):
+            self.jog_pad.set_position(f"X {dx:+.3f}  Y {dy:+.3f}  Z {dz:+.3f} mm ({source})")
 
     def _execute_manual_cut(self) -> None:
         if self.grbl_controller is None or not self.position_verified:
@@ -7360,8 +8354,42 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
                 self._send_machine_line(line)
             self._record_relative_move(axis, delta)
     def closeEvent(self, event) -> None:
+        self.save_window_layout()
+        app = QApplication.instance()
+        if app is not None and getattr(self, "window_fitter", None) is not None:
+            app.removeEventFilter(self.window_fitter)
         self.handle_clean_shutdown()
         super().closeEvent(event)
+
+    def save_window_layout(self) -> None:
+        """Docks and toolbars, plus the un-maximised size, for the next start."""
+        self.settings.setValue("window/state", self.saveState())
+        normal = self.normalGeometry()
+        if normal.isValid():
+            self.settings.setValue("window/normal", [normal.x(), normal.y(), normal.width(), normal.height()])
+
+    def restore_window_layout(self) -> None:
+        """Restore docks and toolbars and the last normal size; the window still opens maximised."""
+        state = self.settings.value("window/state")
+        if state:
+            try:
+                self.restoreState(state)
+            except TypeError:
+                pass
+        normal = self.settings.value("window/normal")
+        try:
+            x, y, w, h = (int(v) for v in normal)
+        except (TypeError, ValueError):
+            x = y = None
+            w, h = 1500, 930
+        if x is not None:
+            self.move(x, y)
+        fit_to_screen(self, (w, h))
+
+    def show_main_window(self) -> None:
+        """Start-up: maximised (title bar and taskbar stay usable), with the saved layout."""
+        self.restore_window_layout()
+        self.showMaximized()
     def _scene_extent(self) -> float:
         extent = 0.0
         for part in self.parts:
@@ -7930,9 +8958,13 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
     def _prompt_import_metadata(self, default_part_name: str, replace_workspace: bool) -> tuple[str, str, str, bool] | None:
         dialog = QDialog(self)
         dialog.setWindowTitle("Part & Job Setup")
+        make_working_window(dialog)
         form = QFormLayout(dialog)
 
-        job_input = QLineEdit(self.project_name_label.text())
+        current = self.project_name_label.text().strip()
+        unnamed = current in ("", "Untitled job")
+        # a new or unnamed project takes the name of the part being opened
+        job_input = QLineEdit(default_part_name if (replace_workspace or unnamed) else current)
         job_input.setToolTip("Name of the overall machining job/project")
         form.addRow("Job name", job_input)
 
@@ -7982,7 +9014,8 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             return None
 
         self.settings.setValue("import/keep_file_coordinates", keep_coordinates.isChecked())
-        job_name = job_input.text().strip() or ("Untitled job" if replace_workspace else self.project_name_label.text())
+        job_name = job_input.text().strip() or (
+            default_part_name if (replace_workspace or unnamed) else current) or "Untitled job"
         part_name = part_input.text().strip() or default_part_name
         return job_name, part_name, material_combo.currentText(), keep_coordinates.isChecked()
 
@@ -8111,7 +9144,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         part_index = sorted(self.selected_features)[0][0]
         feature_ids = sorted(f for p, f in self.selected_features if p == part_index)
         if tool is None:
-            picker = ToolLibraryDialog(self.tools, self, picker=True)
+            picker = ToolLibraryDialog(self.tools, self, picker=True, inches=self.units.display is LengthUnit.INCHES)
             if picker.exec() != QDialog.DialogCode.Accepted or picker.selected_tool() is None:
                 return None
             tool = picker.selected_tool()
@@ -8625,25 +9658,19 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             post_name=self.post_compiler.spec.name,
         )
         return write_setup_sheet_files(summary, out_dir)
-    def apply_tool_library_entry(self, tool_id: str) -> ToolLibraryEntry | None:
-        entry = next((t for t in self.tool_library if t.tool_id == tool_id), None)
-        if entry is None:
+    def apply_inventory_tool(self, index: int):
+        """Tools & Speeds > Load: select an inventory tool for the operation being edited."""
+        if not 0 <= index < len(self.tools):
             return None
+        tool = self.tools[index]
         if hasattr(self, "tool_name"):
-            idx = self.tool_name.findText(entry.name)
-            if idx >= 0:
-                self.tool_name.setCurrentIndex(idx)
-            else:
-                self.tool_name.setCurrentText(entry.name)
-        if hasattr(self, "tool_diameter"):
-            self._set_tool_diameter_mm(float(entry.diameter_mm))
-        if hasattr(self, "spindle"):
-            self.spindle.setValue(int(entry.default_rpm))
-        if hasattr(self, "feed"):
-            self.feed.setValue(float(entry.default_feed_mm_min))
-        if hasattr(self, "stepdown"):
-            self.stepdown.setValue(float(entry.default_stepdown_mm))
-        return entry
+            combo_index = self.tool_name.findData(index)
+            if combo_index >= 0:
+                self.tool_name.setCurrentIndex(combo_index)
+        self._apply_tool_to_operation(index)
+        if hasattr(self, "flutes_spin"):
+            self.flutes_spin.setValue(max(1, min(int(tool.flute_count or 1), self.flutes_spin.maximum())))
+        return tool
 
     def validate_gcode_and_toolpaths(self, gcode_text: str = "") -> list[GCodeValidationIssue]:
         return self.gcode_validator.validate(
@@ -9548,6 +10575,7 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
         )
         dialog = QDialog(self)
         dialog.setWindowTitle("G-code setup checklist")
+        make_working_window(dialog)
         dialog.setMinimumWidth(520)
         layout = QVBoxLayout(dialog)
         heading = QLabel("Information required before a job can be posted")
@@ -11239,5 +12267,5 @@ def main() -> int:
     app.setFont(QFont("Segoe UI", 10))
     run_first_run_dialog(QSettings("BasiCAM", "BasiCAM CNC"))
     window = BasiCAMWindow()
-    window.show()
+    window.show_main_window()
     return app.exec()

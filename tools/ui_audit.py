@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import SIGNAL, QSettings  # noqa: E402
-from PySide6.QtGui import QAction  # noqa: E402
+from PySide6.QtGui import QAction, QColor  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractSpinBox,
     QApplication,
@@ -93,7 +93,8 @@ def describe(obj) -> str:
 
 
 def collect(window) -> list:
-    widgets = [w for w in window.findChildren(QWidget) if isinstance(w, tuple(SIGNALS))]
+    # only controls of this window, not of dialogs it opened earlier (they stay as children)
+    widgets = [w for w in window.findChildren(QWidget) if isinstance(w, tuple(SIGNALS)) and w.window() is window]
     actions = [a for a in window.findChildren(QAction) if not a.isSeparator() and a.text()]
     return widgets + actions
 
@@ -169,6 +170,7 @@ def fire_checks(window) -> list[tuple[str, str]]:
         mock.patch.object(QDialog, "exec", return_value=0),
         mock.patch.object(QMenu, "exec", return_value=None),
         mock.patch.object(QFileDialog, "getOpenFileName", return_value=("", "")),
+        mock.patch("PySide6.QtWidgets.QColorDialog.getColor", return_value=QColor()),
         mock.patch.object(QFileDialog, "getOpenFileNames", return_value=([], "")),
         mock.patch.object(QFileDialog, "getSaveFileName", return_value=("", "")),
         mock.patch.object(QFileDialog, "getExistingDirectory", return_value=""),
@@ -213,6 +215,41 @@ def fire_checks(window) -> list[tuple[str, str]]:
     return report
 
 
+# v3 Block 5 / 11: the visible commands change with the machine, so each type is audited in turn.
+MACHINE_TYPES = (
+    ("mill", dict(name="Audit mill", process="mill", layout="gantry3")),
+    ("laser", dict(name="Audit laser", process="laser", layout="gantry3")),
+    ("lathe", dict(name="Audit lathe", process="lathe", layout="lathe2", controller="grblHAL")),
+    ("rotary laser", dict(name="Audit rotary laser", process="rotary_laser", layout="gantry3_rotary", controller="grblHAL")),
+)
+
+
+def load_machine(window, **kw) -> None:
+    from basicam.machine_profiles import MachineProfile
+
+    machine = MachineProfile(**kw)
+    window.machine_store.save(machine)
+    with mock.patch.object(window, "_maybe_ask_job_type"):
+        window._set_current_machine(machine.machine_id, load_state=False)
+        QApplication.processEvents()
+
+
+def extra_windows(window) -> list:
+    """Windows that are not children until opened: ports, preflight (with its pad), limit-switch test."""
+    from basicam.limit_test import LimitSwitchTestDialog
+    from basicam.machine_profiles import PreflightDialog
+    from basicam.ports_dialog import PortsDialog
+
+    ports = PortsDialog(window, details=lambda: [], test=lambda d, b: "", connect=lambda d, b: None,
+                        use_for_machine=lambda d, b: "")
+    ports.timer.stop()
+    pad = window.make_jog_pad()
+    actions = {"home": lambda: None, "unlock": lambda: None, "hold": lambda: None, "kill": lambda: None}
+    preflight = PreflightDialog(None, "XYZ", window, pad=pad, actions=actions)
+    limits = LimitSwitchTestDialog(window, axes="XYZ", settings={5: 0}, firmware="grbl", send_setting=lambda line: None)
+    return [ports, preflight, limits]
+
+
 def run(fire: bool = False) -> list[tuple[str, str]]:
     app = QApplication.instance() or QApplication([])
     import pyvista as pv
@@ -226,19 +263,35 @@ def run(fire: bool = False) -> list[tuple[str, str]]:
         def factory(*_a, **_k):
             return QSettings(path, QSettings.Format.IniFormat)
 
+        # The audit never touches real hardware: no serial ports are listed and none can be opened.
+        def no_port(*_a, **_k):
+            raise OSError("ui_audit: serial ports are disabled")
+
         with mock.patch.object(app_module, "QSettings", side_effect=factory), mock.patch.dict(
             os.environ, {"LOCALAPPDATA": tmp}
-        ):
-            window = app_module.BasiCAMWindow()
-            try:
-                report = static_checks(window)
-                if fire:
-                    report += fire_checks(window)
-            finally:
-                window.terminal_core.close()
-                window.plotter.close()
-                window.close()
-                app.processEvents()
+        ), mock.patch("basicam.machine.list_ports.comports", return_value=[]),                 mock.patch("basicam.machine.serial.Serial", side_effect=no_port):
+            report: list[tuple[str, str]] = []
+            # each pass gets a fresh window: firing changes the workspace (adds setups, deletes operations)
+            for label, kw in (("", None),) + MACHINE_TYPES:
+                window = app_module.BasiCAMWindow()
+                try:
+                    if kw is not None:
+                        load_machine(window, **kw)
+                    found = static_checks(window)
+                    if fire:
+                        found += fire_checks(window)
+                    if kw is None:
+                        for dialog in extra_windows(window):
+                            found += [(kind, f"[{dialog.windowTitle()}] {detail}") for kind, detail in static_checks(dialog)]
+                            if fire:
+                                found += [(kind, f"[{dialog.windowTitle()}] {detail}") for kind, detail in fire_checks(dialog)]
+                            dialog.close()
+                    report += [(kind, f"[{label}] {detail}" if label else detail) for kind, detail in found]
+                finally:
+                    window.terminal_core.close()
+                    window.plotter.close()
+                    window.close()
+                    app.processEvents()
     return report
 
 

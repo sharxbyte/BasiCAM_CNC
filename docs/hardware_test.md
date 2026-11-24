@@ -6,26 +6,29 @@ Machine: ______________ Controller / firmware: ______________ Date: __________ T
 
 ## 1. Connection and identification
 
-- [ ] The serial port appears after **Refresh**; **Connect** shows the GRBL version (`$I`) and the header reads "Connected - not homed".
+- [ ] **Machine > Ports...** lists the controller's port (with its USB chip) and adds it within 2 s of plugging it in.
+- [ ] **Connect** waits for the start-up message, then shows the firmware and version (`$I`) and the header reads "Connected - not homed".
 - [ ] `status` in the console prints only `;` comment lines and sends nothing that moves the machine.
-- [ ] The preflight dialog opens after connecting; the jog buttons stay disabled until every axis is ticked.
-- [ ] After a soft reset or alarm, the preflight dialog opens again. After a soft-limit stop it does not.
+- [ ] The preflight window opens once the position is verified (Home, or Verify position); normal jogs stay disabled until every axis is ticked.
+- [ ] After a soft reset or alarm, the preflight window opens again once the position is verified. After a soft-limit stop it does not.
 
 ## 2. Limits and keep-out
 
 - [ ] **Soft limits...**: jog each axis to its endstop, press **Record**; the stored values match the controller's machine position.
 - [ ] The default margin is 20 mm. Below 5 mm, or **Released**, is refused unless the gate is on.
 - [ ] Z: with the longest tool mounted (stick-out = overall length - 12 mm), the lowest Z is recorded; a shorter tool may go lower by the difference.
-- [ ] A jog that would put the tool envelope past a soft limit is refused with an alarm; one into the hard zone is refused even with the gate on.
+- [ ] A jog that would put an axis past its soft limit is refused with an alarm; one into the hard zone is refused even with the gate on.
+- [ ] An axis can be jogged to within 1 mm of its soft limit (and back there after moving away); the tool outline is not counted against the travel.
+- [ ] With a clamp set up as a fixture, a jog that brings the tool within 5 mm of it (cutter included) is refused; a feed move into stock deeper than the tool's cutting length is refused.
 - [ ] Add a keep-out zone (machine setup or a fixture marked **Keep out**): jogs into it are refused; jogs over it with clearance are allowed.
 
 ## 3. Motion
 
 - [ ] Homing (**Home ($H)**) completes and the header reads "Connected - ready".
-- [ ] Each jog button moves the right axis in the right direction by the set step, at the set feed.
+- [ ] Each jog-pad arrow moves the right axis in the right direction by that axis's step, at the XY or Z feed (see section 14).
 - [ ] Keyboard control, **Virtual** on: arrows move only the ghost and the DRO; nothing is sent (check the console).
 - [ ] Keyboard control, Virtual off: X / + / 5 / Enter shows a ghost; the second Enter moves 5 mm; Esc at each step backs out.
-- [ ] **End** feed-holds; **Resume** continues; the kill button stops the spindle and retracts Z without hitting the top stop.
+- [ ] **End** feed-holds; **Resume** continues; **KILL** (pad, status bar or any machine window) stops the spindle and retracts Z without hitting the top stop.
 
 ## 4. Speed multiplier
 
@@ -77,3 +80,57 @@ Machine: ______________ Controller / firmware: ______________ Date: __________ T
 - [ ] A manual-speed headstock pauses with the RPM prompt.
 - [ ] **Open chuck** is refused while the spindle turns.
 - [ ] Bar feed: a production run of 3 parts parts off, stops the spindle, opens the chuck, advances the bar to the stop, closes the chuck and continues; the job report shows 3 parts and the bar used.
+
+## 11. Connection: firmware and baud rate (each controller you use)
+
+Machine: ______________ Firmware: GRBL / grblHAL / FluidNC ______ Baud set in the firmware: ______
+
+- [ ] At the firmware's baud rate, **Connect** identifies the firmware within the boot wait (3 s by default) on a board that resets when the port opens (Arduino-based GRBL).
+- [ ] At a wrong baud rate, the panel says "wrong baud rate?" (or "No reply") and lists the likely causes; nothing is enabled.
+- [ ] **Baud rate: Auto** finds the firmware's rate and stores it on the machine.
+- [ ] With the port open in another program, the error says so and nothing hangs.
+- [ ] **Test connection** shows firmware, version, options, axes, state, inputs and the round-trip time, and moves nothing.
+- [ ] Unplugging the cable while connected shows "Controller not responding" within about 5 s; a running program is feed-held.
+- [ ] grblHAL and FluidNC: the header shows the right firmware name; Home, jog and the console behave as with GRBL.
+
+## 12. From connected to moving (step by step; write down what the terminal shows)
+
+Follow the machine panel's **Ready checklist** from the top. At each step note the checklist item highlighted and the last terminal line.
+
+1. Connected: ______________________________________________
+2. Firmware identified: ____________________________________
+3. Not in alarm (Unlock or Home, as offered): _______________
+4. Position verified (Home, or Verify position for a machine without switches): ______
+5. Preflight done (preflight window, each axis moved both ways and ticked): ______
+6. Ready: one pad jog of 1 mm on each axis moves exactly 1 mm: ______
+
+- [ ] Every disabled button shows why in its tool tip, and every refused click writes the reason in the terminal and status bar.
+- [ ] A controller that starts in alarm with homing enabled offers **Home** (not only Unlock), and homing clears it.
+- [ ] Machine without homing switches: **Verify position** asks where the tool is; the DRO reads "position set by you"; a jog beyond the travel is refused.
+
+## 13. Alarms and the limit-switch test
+
+- [ ] The inputs line in the machine panel shows each limit as you press it by hand.
+- [ ] **Limit-switch test**: press and release every limit switch; each row turns ON then off and shows "works".
+- [ ] If every limit reads ON with nothing pressed: the panel explains it (inverted pins, normally-closed switches, floating inputs, noise) and shows `$5`, `$21`, `$22`. **Invert limit pins ($5)** sends the change, then the test starts again: press every switch again and confirm each one works. FluidNC: the test says to change `config.yaml` instead.
+- [ ] `$21=0`, `$20=0` and `$5=...` typed in the console are refused.
+- [ ] An alarm shows its meaning for the identified firmware and what to do next.
+
+## 14. Jog pad: directions and steps
+
+- [ ] With the machine's axes as labelled, X+ / X− / Y+ / Y− move the way the arrows point; if not, **Flip X arrows** / **Flip Y arrows** fixes it and is remembered for this machine.
+- [ ] The corner arrows move X and Y together in one move.
+- [ ] Each step (0.01, 0.1, 1, 10, 100 mm, or the inch steps) moves exactly that far; measure 10 mm and 100 mm with a rule or indicator.
+- [ ] **Custom...** `0.05in` moves 1.27 mm and stays in the list after restarting BasiCAM.
+- [ ] **Link X/Y** on: changing the X step changes the Y step; off: they are separate. Z always has its own step.
+- [ ] **Hold to move**: the axis moves while the arrow is held and stops at once on release.
+- [ ] **XY 0** asks first, raises Z to a safe height, then goes to work X0 Y0.
+- [ ] Rotary machine: the A (or B / C) row turns by its step in degrees.
+- [ ] Keyboard arrows use the pad's steps (Shift x10, Ctrl /10).
+
+## 15. Preflight jogs
+
+- [ ] Before the position is verified the preflight window offers only Home and Unlock (and KILL).
+- [ ] After verifying, the pad in the preflight window jogs each axis; a jog into a keep-out or past a limit is refused and nothing moves.
+- [ ] An axis's tick is offered only after it has moved both ways; normal jogs work only after every axis is ticked.
+- [ ] The console and DRO stay usable while the preflight window is open.

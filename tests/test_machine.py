@@ -40,7 +40,7 @@ class GrblProtocolTests(unittest.TestCase):
             ["[VER:1.1h.2024:]", "[OPT:V,15,128]", "[AXS:3:XYZ]"]
         )
         self.assertIsNotNone(capabilities)
-        self.assertEqual(capabilities.version, "1.1h.2024:")
+        self.assertEqual(capabilities.version, "1.1h.2024")  # v3: the trailing ":" of [VER:...:] is dropped
         self.assertEqual(capabilities.axes, "XYZ")
 
     def test_jog_command_is_limited_and_serial_lines_are_buffered(self) -> None:

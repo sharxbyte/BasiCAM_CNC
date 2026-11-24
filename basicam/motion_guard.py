@@ -54,18 +54,38 @@ class Violation:
 
 @dataclass(frozen=True)
 class ToolEnvelope:
+    """The tool as its own moving body (cutter, shank, holder, plus clearance), carried with the tip.
+
+    It is checked against obstacles, not against the axis travel: no part of it may enter a keep-out
+    zone (machine parts) or a fixture (jigs, clamps). Only the cutting zone - the first
+    ``cutting_length`` above the tip - may enter stock or part material, and only on a feed move."""
+
     radius: float
     below_tip: float = ENVELOPE_CLEARANCE_MM
     height: float = 40.0  # stick-out above the tip
+    cutting_length: float = 0.0  # cutting zone measured from the tip; above it is shank / holder
 
     @classmethod
     def from_tool(cls, tool) -> "ToolEnvelope":
         diameter = float(getattr(tool, "diameter_mm", 6.0) or 6.0) if tool is not None else 6.0
+        if tool is not None and hasattr(tool, "max_radius_mm"):
+            diameter = max(diameter, 2.0 * float(tool.max_radius_mm()))  # shank / neck wider than the cutter
+        elif tool is not None:
+            diameter = max(diameter, float(getattr(tool, "shank_diameter_mm", 0.0) or 0.0))
         stick = tool_stick_out(tool) if tool is not None else 40.0
         # the holder / collet nut is part of the envelope (Block 11)
         holder = float(getattr(tool, "holder_diameter_mm", 0.0) or 0.0) if tool is not None else 0.0
         holder_length = float(getattr(tool, "holder_length_mm", 0.0) or 0.0) if tool is not None else 0.0
-        return cls(radius=max(diameter, holder) / 2.0 + ENVELOPE_CLEARANCE_MM, height=max(stick + holder_length, 1.0))
+        height = max(stick + holder_length, 1.0)
+        cutting = 0.0
+        if tool is not None:
+            cutting = float(getattr(tool, "cutting_length_mm", 0.0) or getattr(tool, "flute_length_mm", 0.0) or 0.0)
+        return cls(radius=max(diameter, holder) / 2.0 + ENVELOPE_CLEARANCE_MM, height=height,
+                   cutting_length=min(max(cutting, 0.0), height))
+
+    def body(self) -> "ToolEnvelope":
+        """The non-cutting part (shank, holder) as an envelope whose 'tip' is the top of the cutting zone."""
+        return ToolEnvelope(self.radius, 0.0, max(self.height - self.cutting_length, 0.0), 0.0)
 
 
 @dataclass(frozen=True)
@@ -104,30 +124,63 @@ def _samples(start: Sequence[float], end: Sequence[float], step: float) -> list[
     return [tuple(start[i] + (end[i] - start[i]) * k / n for i in range(3)) for k in range(n + 1)]
 
 
-def _limit_violations(machine: MachineProfile, tool, env: ToolEnvelope, point: Vec, release_allowed: bool) -> list[Violation]:
+def _envelope_hits_stock(tip: Sequence[float], env: ToolEnvelope, lo: Sequence[float], hi: Sequence[float],
+                         cutting: bool) -> bool:
+    """Stock / part: a rapid may not touch it at all; a feed move may cut with the cutting zone only."""
+    if not cutting:
+        return _envelope_hits_box(tip, env, lo, hi)
+    body_tip = (tip[0], tip[1], tip[2] + env.cutting_length)
+    return env.body().height > 0 and _envelope_hits_box(body_tip, env.body(), lo, hi)
+
+
+def _extents(machine: MachineProfile, tool, env: ToolEnvelope, point: Vec, index: int) -> tuple[float, float, float, float]:
+    """(low extent, high extent, min limit, max limit) checked against one axis's travel.
+
+    X / Y travel limits are the axis's own end stops, so they apply to the axis position; the tool's
+    outline is a separate body checked against fixtures, keep-outs and stock. Z min stays tool-aware
+    (z_min_for: the lowest tip height for this tool's stick-out, with the clearance below the tip)."""
+    axis = AXES[index]
+    lo, hi = machine.hard_bounds(axis)
+    if axis == "Z":
+        return point[2] - env.below_tip, point[2], machine.z_min_for(tool), hi
+    return point[index], point[index], lo, hi
+
+
+def _limit_violations(machine: MachineProfile, tool, env: ToolEnvelope, point: Vec, release_allowed: bool,
+                      start: Vec | None = None) -> list[Violation]:
+    """Hard / soft limit violations of the envelope at ``point``.
+
+    v3 Block 8: with ``start`` (the move's start), an axis that already touches a limit at the start
+    may stay there or move away from it; it may never move further into the limit. Without this a
+    homed machine (sitting at its limits) refused every jog, including jogs away from the limits."""
     out: list[Violation] = []
     for index, axis in enumerate(AXES):
-        lo, hi = machine.hard_bounds(axis)
-        if axis == "Z":
-            lo = machine.z_min_for(tool)
-            low_extent, high_extent = point[2] - env.below_tip, point[2]
-        else:
-            low_extent, high_extent = point[index] - env.radius, point[index] + env.radius
-        if low_extent <= lo:
-            out.append(Violation(ViolationKind.HARD, f"{axis} envelope reaches the {axis} min hard limit ({lo:.2f})", axis))
+        low_extent, high_extent, lo, hi = _extents(machine, tool, env, point, index)
+        what = "tool tip" if axis == "Z" else "axis"
+        away_from_min = away_from_max = False
+        if start is not None:
+            s_low, s_high, _lo, _hi = _extents(machine, tool, env, start, index)
+            away_from_min = s_low <= lo and point[index] >= start[index] - 1e-9
+            away_from_max = s_high >= hi and point[index] <= start[index] + 1e-9
+        if low_extent <= lo and not away_from_min:
+            out.append(Violation(ViolationKind.HARD, f"{axis} {what} reaches the {axis} min hard limit ({lo:.2f})", axis))
             continue
-        if high_extent >= hi:
-            out.append(Violation(ViolationKind.HARD, f"{axis} envelope reaches the {axis} max hard limit ({hi:.2f})", axis))
+        if high_extent >= hi and not away_from_max:
+            out.append(Violation(ViolationKind.HARD, f"{axis} {what} reaches the {axis} max hard limit ({hi:.2f})", axis))
             continue
         limit = machine.soft_limits.get(axis)
         margin_min = limit.margin_min if limit else 0.0
         margin_max = limit.margin_max if limit else 0.0
         released_min = bool(limit and limit.released_min and release_allowed)
         released_max = bool(limit and limit.released_max and release_allowed)
+        if start is not None:
+            s_low, s_high, _lo, _hi = _extents(machine, tool, env, start, index)
+            released_min = released_min or (s_low < lo + margin_min and point[index] >= start[index] - 1e-9)
+            released_max = released_max or (s_high > hi - margin_max and point[index] <= start[index] + 1e-9)
         if not released_min and low_extent < lo + margin_min:
-            out.append(Violation(ViolationKind.SOFT, f"{axis} envelope crosses the {axis} min soft limit ({lo + margin_min:.2f})", axis))
+            out.append(Violation(ViolationKind.SOFT, f"{axis} {what} crosses the {axis} min soft limit ({lo + margin_min:.2f})", axis))
         elif not released_max and high_extent > hi - margin_max:
-            out.append(Violation(ViolationKind.SOFT, f"{axis} envelope crosses the {axis} max soft limit ({hi - margin_max:.2f})", axis))
+            out.append(Violation(ViolationKind.SOFT, f"{axis} {what} crosses the {axis} max soft limit ({hi - margin_max:.2f})", axis))
     return out
 
 
@@ -151,17 +204,21 @@ def check_move(
     found: dict[tuple[ViolationKind, str | None], Violation] = {}
     for point in _samples(start, end, env.radius / 2.0):
         if machine is not None:
-            for v in _limit_violations(machine, tool, env, point, release_allowed):
+            for v in _limit_violations(machine, tool, env, point, release_allowed, start=tuple(start)):
                 found.setdefault((v.kind, v.axis), replace(v, line=line))
         for ob in obstacles:
-            if not _envelope_hits_box(point, env, ob.min_xyz, ob.max_xyz):
-                continue
-            if ob.kind == "keepout":
-                found.setdefault((ViolationKind.KEEPOUT, ob.name), Violation(ViolationKind.KEEPOUT, f"enters keep-out zone '{ob.name}'", None, line))
-            elif ob.kind == "fixture":
-                found.setdefault((ViolationKind.COLLISION, ob.name), Violation(ViolationKind.COLLISION, f"collides with fixture '{ob.name}'", None, line))
-            elif not cutting:
-                found.setdefault((ViolationKind.COLLISION, ob.name), Violation(ViolationKind.COLLISION, f"rapid move through {ob.kind} '{ob.name}'", None, line))
+            if ob.kind in ("keepout", "fixture"):
+                # machine parts, jigs and clamps: no part of the tool, cutter included, may touch them
+                if not _envelope_hits_box(point, env, ob.min_xyz, ob.max_xyz):
+                    continue
+                if ob.kind == "keepout":
+                    found.setdefault((ViolationKind.KEEPOUT, ob.name), Violation(ViolationKind.KEEPOUT, f"enters keep-out zone '{ob.name}'", None, line))
+                else:
+                    found.setdefault((ViolationKind.COLLISION, ob.name), Violation(ViolationKind.COLLISION, f"collides with fixture '{ob.name}'", None, line))
+            elif _envelope_hits_stock(point, env, ob.min_xyz, ob.max_xyz, cutting):
+                text = (f"the tool's shank or holder would enter {ob.kind} '{ob.name}' (deeper than its cutting length)"
+                        if cutting else f"rapid move through {ob.kind} '{ob.name}'")
+                found.setdefault((ViolationKind.COLLISION, ob.name), Violation(ViolationKind.COLLISION, text, None, line))
     # A HARD violation on an axis supersedes SOFT on the same axis.
     hard_axes = {v.axis for v in found.values() if v.kind is ViolationKind.HARD}
     return [v for v in found.values() if not (v.kind is ViolationKind.SOFT and v.axis in hard_axes)]
@@ -218,8 +275,9 @@ def check_joint_move(
                 found.setdefault((ViolationKind.HARD, name), Violation(
                     ViolationKind.HARD, f"{name} {value:.2f}° is beyond its limit ({spec.minimum:g}° to {spec.maximum:g}°)", name, line))
         xyz = (joints.get("X", 0.0), joints.get("Y", 0.0), joints.get("Z", 0.0))
+        start_xyz = (float(start.get("X", 0.0)), float(start.get("Y", 0.0)), float(start.get("Z", 0.0)))
         if setup.layout in ("gantry3", "gantry3_rotary", "table_table5"):
-            for v in _limit_violations(machine, tool, env, xyz, release_allowed):
+            for v in _limit_violations(machine, tool, env, xyz, release_allowed, start=start_xyz):
                 found.setdefault((v.kind, v.axis), replace(v, line=line))
         # the tool in machine coordinates: tip and points up its axis
         if setup.layout == "head_table5":
@@ -230,12 +288,20 @@ def check_joint_move(
             axis_m = np.array([0.0, 0.0, 1.0])
         tip_m = np.asarray(xyz, dtype=float)
         points_m = [tip_m + axis_m * (reach * i / 3.0) for i in range(4)]
+        # above the cutting zone (shank / holder): may not enter stock even while cutting
+        body_m = [tip_m + axis_m * (env.cutting_length + (reach - env.cutting_length) * i / 3.0) for i in range(4)] \
+            if reach > env.cutting_length else []
+        slab = ToolEnvelope(env.radius, env.below_tip, 0.0)
         for ob in fixed:
-            if any(_envelope_hits_box(p, ToolEnvelope(env.radius, env.below_tip, 0.0), ob.min_xyz, ob.max_xyz) for p in points_m):
+            hard = ob.kind in ("keepout", "fixture")
+            checked = points_m if (hard or not cutting) else body_m
+            if any(_envelope_hits_box(p, slab if checked is points_m else ToolEnvelope(env.radius, 0.0, 0.0),
+                                      ob.min_xyz, ob.max_xyz) for p in checked):
                 key = (ViolationKind.KEEPOUT if ob.kind == "keepout" else ViolationKind.COLLISION, ob.name)
                 text = f"enters keep-out zone '{ob.name}'" if ob.kind == "keepout" else f"collides with '{ob.name}'"
-                if ob.kind == "keepout" or ob.kind == "fixture" or not cutting:
-                    found.setdefault(key, Violation(key[0], text, None, line))
+                if not hard and cutting:
+                    text = f"the tool's shank or holder would enter {ob.kind} '{ob.name}' (deeper than its cutting length)"
+                found.setdefault(key, Violation(key[0], text, None, line))
         if turning:
             tip_w, axis_w = forward(setup, joints)
             points_w = [tip_w + axis_w * (reach * i / 3.0) for i in range(4)]
@@ -418,7 +484,9 @@ class MotionGuard:
     def position(self) -> Vec:
         status = getattr(self.window, "grbl_status", None)
         if status is not None and status.machine_position:
-            return tuple(status.machine_position[:3])
+            # machines without homing switches: the position the owner set (v3 Block 8)
+            offset = getattr(self.window, "user_position_offset", None) or (0.0, 0.0, 0.0)
+            return tuple(float(status.machine_position[i]) + float(offset[i]) for i in range(3))
         if status is not None and status.work_position:
             wco = self.work_offset()
             return tuple(status.work_position[i] + wco[i] for i in range(3))
@@ -454,6 +522,46 @@ class MotionGuard:
             self.machine(), self.tool(), start, tuple(end), replace(GrblModalState(), motion="G1"),
             obstacles=self.obstacles(), release_allowed=self.release_allowed(),
         )
+
+    def check_axis_jog(self, axis: str, distance: float) -> list[Violation]:
+        """X / Y / Z through check_jog; a rotary or extra axis through the multi-axis joint check."""
+        axis = axis.upper()
+        if axis in AXES:
+            return self.check_jog(axis, distance)
+        x, y, z = self.position()
+        status = getattr(self.window, "grbl_status", None)
+        joints = {"X": x, "Y": y, "Z": z}
+        for name, value in getattr(status, "axis_values", ()) or ():
+            if name not in "XYZ":
+                joints[name] = float(value)
+        joints.setdefault(axis, 0.0)
+        end = dict(joints)
+        end[axis] = joints[axis] + float(distance)
+        return check_joint_move(self.machine(), self.tool(), joints, end, obstacles=self.obstacles(),
+                                release_allowed=self.release_allowed())
+
+    def check_jog_moves(self, moves: dict) -> list[Violation]:
+        """One jog moving several axes together (relative distances by axis name)."""
+        moves = {a.upper(): float(d) for a, d in moves.items()}
+        if len(moves) == 1:
+            axis, distance = next(iter(moves.items()))
+            return self.check_axis_jog(axis, distance)
+        if all(a in AXES for a in moves):
+            start = self.position()
+            end = tuple(start[i] + moves.get(AXES[i], 0.0) for i in range(3))
+            return check_move(self.machine(), self.tool(), start, end, replace(GrblModalState(), motion="G1"),
+                              obstacles=self.obstacles(), release_allowed=self.release_allowed())
+        x, y, z = self.position()
+        status = getattr(self.window, "grbl_status", None)
+        joints = {"X": x, "Y": y, "Z": z}
+        for name, value in getattr(status, "axis_values", ()) or ():
+            if name not in "XYZ":
+                joints[name] = float(value)
+        end = dict(joints)
+        for axis, distance in moves.items():
+            end[axis] = joints.get(axis, 0.0) + distance
+        return check_joint_move(self.machine(), self.tool(), joints, end, obstacles=self.obstacles(),
+                                release_allowed=self.release_allowed())
 
     def check_line(self, command: str) -> list[Violation]:
         return check_program(

@@ -14,6 +14,8 @@ from typing import Any, Iterable
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QGridLayout,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -38,6 +40,7 @@ from PySide6.QtWidgets import (
 from basicam.cam_envelope_stock_removal import MachineKinematicsProfile
 from basicam.auxiliaries import AuxOutput
 from basicam.bar_feed import BarFeed
+from basicam.window_fit import scrollable
 from basicam.rotary_devices import DEVICE_KINDS, MOUNTS, RotaryDevice
 from basicam.tool_changer import CHANGER_LABELS, ToolChanger, ToolTable
 from basicam.machine_types import (
@@ -181,6 +184,12 @@ class MachineProfile:
     rotary_devices: list[RotaryDevice] = field(default_factory=list)
     active_rotary: int = 0
     bar_feed: BarFeed = field(default_factory=BarFeed)  # v2 Block 22
+    # v3 Block 2: how BasiCAM reaches this machine (auto_connect is reserved; it stays off)
+    port: str = ""
+    baud: int = 115200
+    auto_connect: bool = False
+    boot_wait_s: float = 3.0  # v3 Block 7: how long to wait for the controller's start-up message
+    has_homing_switches: bool = True  # v3 Block 8: without switches the owner sets the position by hand
 
     def rotary_device(self) -> RotaryDevice | None:
         if not self.rotary_devices:
@@ -362,19 +371,33 @@ class MachineStore:
 
 
 # ====================================================================== Qt widgets
+BAUD_RATES = ("115200", "250000", "230400", "57600", "38400", "19200", "9600")
+
+
 class MachinesTab(QWidget):
-    """Machine inventory editor (a tab in the tool inventory window)."""
+    """Machine inventory editor (a tab in the tool inventory window).
+
+    Edits are tracked: switching machine, New, Remove or closing with unsaved edits asks
+    Save / Discard / Cancel. No button is a default button, so Enter never creates or removes
+    a machine."""
 
     machinesChanged = Signal()
+    dirtyChanged = Signal(bool)
 
-    def __init__(self, store: MachineStore, parent=None) -> None:
+    def __init__(self, store: MachineStore, parent=None, connect_callback=None, is_connected=None) -> None:
         super().__init__(parent)
         self.store = store
         self.machines = store.list()
+        self.connect_callback = connect_callback  # main window: connect to a profile (normal path)
+        self.is_connected = is_connected or (lambda _m: False)
+        self._dirty = False
+        self._loading = False
+        self._row = -1
+        self._unsaved_new: set[str] = set()  # created here, not yet saved by the owner
         root = QHBoxLayout(self)
         left = QVBoxLayout()
         self.list_widget = QListWidget()
-        self.list_widget.currentRowChanged.connect(self._select)
+        self.list_widget.currentRowChanged.connect(self._row_changed)
         left.addWidget(self.list_widget, 1)
         row = QHBoxLayout()
         add = QPushButton("New machine")
@@ -394,6 +417,16 @@ class MachinesTab(QWidget):
         self.controller.addItems(list(CONTROLLERS))
         self.controller.setToolTip("GRBL, grblHAL and FluidNC are run from BasiCAM; export-only controllers get a G-code file.")
         form.addRow("Controller", self.controller)
+        self.port = QComboBox()
+        self.port.setEditable(True)
+        self.port.setToolTip("Serial port this machine is plugged into (Machine > Ports... lists them).")
+        self._fill_ports()
+        form.addRow("Port", self.port)
+        self.baud = QComboBox()
+        self.baud.setEditable(True)
+        self.baud.addItems(list(BAUD_RATES))
+        self.baud.setToolTip("Serial speed set in the controller firmware; GRBL and grblHAL usually use 115200.")
+        form.addRow("Baud rate", self.baud)
         self.process = QComboBox()
         for key, label in PROCESSES.items():
             self.process.addItem(label, key)
@@ -437,6 +470,9 @@ class MachinesTab(QWidget):
         self.homing.addItems(["max", "min"])
         self.homing.setToolTip("Direction the machine homes; GRBL default is max with negative travel.")
         form.addRow("Homing direction", self.homing)
+        self.homing_switches = QCheckBox("Homing switches fitted")
+        self.homing_switches.setToolTip("Untick for a machine without homing switches: you then tell BasiCAM where the tool is.")
+        form.addRow("", self.homing_switches)
         self.probe = QCheckBox("Probe present")
         form.addRow("", self.probe)
         self.tool_change = QComboBox()
@@ -466,11 +502,140 @@ class MachinesTab(QWidget):
         save = QPushButton("Save machine")
         save.setObjectName("primaryButton")
         save.clicked.connect(self._save)
-        form.addRow(save)
+        self.save_button = save
         right = QWidget()
         right.setLayout(form)
-        root.addWidget(right, 2)
+        # The form scrolls; Save stays pinned below it so it is always reachable.
+        right_column = QVBoxLayout()
+        right_column.addWidget(scrollable(right), 1)
+        self.dirty_label = QLabel("Unsaved changes")
+        self.dirty_label.setObjectName("warningLabel")
+        self.dirty_label.setVisible(False)
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.dirty_label, 1)
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.setToolTip("Connect to this machine on its port (asks first, like Machine > Connect).")
+        self.connect_button.clicked.connect(self._connect_current)
+        self.connect_button.setVisible(connect_callback is not None)
+        bottom.addWidget(self.connect_button)
+        bottom.addWidget(save)
+        right_column.addLayout(bottom)
+        root.addLayout(right_column, 2)
+        for button in self.findChildren(QPushButton):  # Enter never presses New / Remove / Save
+            button.setAutoDefault(False)
+            button.setDefault(False)
+        self._watch_edits(right)
         self._refresh_list()
+
+    # ------------------------------------------------------------ unsaved edits (v3 Block 2)
+    def _watch_edits(self, container: QWidget) -> None:
+        for widget in container.findChildren(QLineEdit):
+            if isinstance(widget.parent(), (QComboBox, QAbstractSpinBox)):
+                continue
+            widget.textEdited.connect(self._mark_dirty)
+        for widget in container.findChildren(QComboBox):
+            widget.currentIndexChanged.connect(self._mark_dirty)
+            if widget.isEditable():
+                widget.editTextChanged.connect(self._mark_dirty)
+        for widget in container.findChildren(QAbstractSpinBox):
+            widget.valueChanged.connect(self._mark_dirty)
+        for widget in container.findChildren(QCheckBox):
+            widget.toggled.connect(self._mark_dirty)
+        for widget in container.findChildren(QTextEdit):
+            widget.textChanged.connect(self._mark_dirty)
+        for widget in container.findChildren(QTableWidget):
+            widget.itemChanged.connect(self._mark_dirty)
+            widget.model().rowsInserted.connect(self._mark_dirty)
+            widget.model().rowsRemoved.connect(self._mark_dirty)
+
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    def _mark_dirty(self, *_args) -> None:
+        if self._loading or self._dirty or self.current_machine() is None:
+            return
+        self._set_dirty(True)
+
+    def _set_dirty(self, dirty: bool) -> None:
+        self._dirty = dirty
+        self.dirty_label.setVisible(dirty)
+        row = self._row
+        if 0 <= row < self.list_widget.count() and row < len(self.machines):
+            self.list_widget.item(row).setText(self._list_text(self.machines[row]) + (" *" if dirty else ""))
+        self.dirtyChanged.emit(dirty)
+
+    def maybe_save(self) -> bool:
+        """Unsaved edits: ask Save / Discard / Cancel. True means it is fine to move on."""
+        if not self._dirty:
+            return True
+        m = self.current_machine()
+        answer = QMessageBox.question(
+            self,
+            "Unsaved machine",
+            f"Save the changes to {m.name if m else 'this machine'}?",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Save:
+            return self._save()
+        if answer == QMessageBox.StandardButton.Discard:
+            self._select(self._row)  # back to the stored values
+            return True
+        return False
+
+    def _row_changed(self, index: int) -> None:
+        if index == self._row:
+            return
+        if self._dirty:
+            self.list_widget.blockSignals(True)
+            self.list_widget.setCurrentRow(self._row)  # stay until the owner decides
+            self.list_widget.blockSignals(False)
+            target_id = self.machines[index].machine_id if 0 <= index < len(self.machines) else None
+            if not self.maybe_save():
+                return
+            index = next((i for i, m in enumerate(self.machines) if m.machine_id == target_id), -1)
+            if index < 0:
+                return
+            self.list_widget.blockSignals(True)
+            self.list_widget.setCurrentRow(index)
+            self.list_widget.blockSignals(False)
+        self._select(index)
+
+    def _list_text(self, m: "MachineProfile") -> str:
+        text = m.name
+        if m.port:
+            text += f" · {m.port}"
+            if self.is_connected(m):
+                text += " (connected)"
+        return text
+
+    def _fill_ports(self) -> None:
+        from basicam.machine import available_serial_ports
+
+        current = self.port.currentText()
+        self.port.blockSignals(True)
+        self.port.clear()
+        self.port.addItem("")
+        try:
+            for device, _description in available_serial_ports():
+                self.port.addItem(device)
+        except Exception:  # noqa: BLE001 - a missing port list must not break the editor
+            pass
+        self.port.setCurrentText(current)
+        self.port.blockSignals(False)
+
+    def _connect_current(self) -> None:
+        m = self.current_machine()
+        if m is None or self.connect_callback is None:
+            return
+        if self._dirty and not self.maybe_save():
+            return
+        m = self.current_machine()
+        if not m.port:
+            QMessageBox.information(self, "Connect", "Set this machine's port first, then save it.")
+            return
+        self.connect_callback(m)
+        self._refresh_list(m.machine_id)
 
     @staticmethod
     def _spin(lo: float, hi: float, value: float) -> QDoubleSpinBox:
@@ -484,12 +649,16 @@ class MachinesTab(QWidget):
         self.list_widget.blockSignals(True)
         self.list_widget.clear()
         for machine in self.machines:
-            self.list_widget.addItem(machine.name)
-        self.list_widget.blockSignals(False)
+            self.list_widget.addItem(self._list_text(machine))
         if self.machines:
             index = next((i for i, m in enumerate(self.machines) if m.machine_id == select_id), 0)
             self.list_widget.setCurrentRow(index)
+            self.list_widget.blockSignals(False)
             self._select(index)
+        else:
+            self.list_widget.blockSignals(False)
+            self._row = -1
+            self._set_dirty(False)
 
     def _add_keep_out_row(self, zone: KeepOutZone) -> None:
         row = self.keep_out_table.rowCount()
@@ -501,7 +670,18 @@ class MachinesTab(QWidget):
     def _select(self, index: int) -> None:
         if not 0 <= index < len(self.machines):
             return
+        self._loading = True
+        try:
+            self._load_fields(index)
+        finally:
+            self._loading = False
+        self._row = index
+        self._set_dirty(False)
+
+    def _load_fields(self, index: int) -> None:
         m = self.machines[index]
+        self.port.setCurrentText(m.port)
+        self.baud.setCurrentText(str(m.baud))
         self.name.setText(m.name)
         self.controller.setCurrentText(m.controller)
         index = self.process.findData(getattr(m, "process", "mill"))
@@ -521,6 +701,7 @@ class MachinesTab(QWidget):
         self.rpm_min.setValue(int(m.spindle_min_rpm))
         self.rpm_max.setValue(int(m.spindle_max_rpm))
         self.homing.setCurrentText(m.homing_direction)
+        self.homing_switches.setChecked(bool(getattr(m, "has_homing_switches", True)))
         self.probe.setChecked(m.probe_present)
         self.tool_change.setCurrentText(m.tool_change_mode)
         self.notes.setPlainText(m.notes)
@@ -583,11 +764,19 @@ class MachinesTab(QWidget):
                                  continuous=cells[4].casefold() in ("yes", "true", "1")))
         return axes
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         m = self.current_machine()
         if m is None:
             m = MachineProfile()
             self.machines.append(m)
+        was_new = m.machine_id in self._unsaved_new
+        try:
+            baud = int(self.baud.currentText().strip() or 115200)
+        except ValueError:
+            QMessageBox.warning(self, "Baud rate", "The baud rate must be a whole number, for example 115200.")
+            return False
+        m.port = self.port.currentText().strip()
+        m.baud = baud
         m.name = self.name.text().strip() or "Machine"
         m.controller = self.controller.currentText()
         m.travel_mm = tuple(s.value() for s in self.travel)
@@ -596,6 +785,7 @@ class MachinesTab(QWidget):
         m.spindle_min_rpm = self.rpm_min.value()
         m.spindle_max_rpm = self.rpm_max.value()
         m.homing_direction = self.homing.currentText()
+        m.has_homing_switches = self.homing_switches.isChecked()
         m.probe_present = self.probe.isChecked()
         m.tool_change_mode = self.tool_change.currentText()
         m.notes = self.notes.toPlainText()
@@ -609,22 +799,45 @@ class MachinesTab(QWidget):
         problems = m.controller_problems()
         if problems:
             QMessageBox.warning(self, "Controller", "\n".join(problems))
-            return
+            return False
         self.store.save(m)
+        self._unsaved_new.discard(m.machine_id)
+        self._dirty = False
         self._refresh_list(m.machine_id)
         self.machinesChanged.emit()
+        if was_new and m.port and self.connect_callback is not None:
+            answer = QMessageBox.question(
+                self, "Connect now?", f"{m.name} is saved. Connect to it on {m.port} now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.connect_callback(m)
+                self._refresh_list(m.machine_id)
+        return True
 
     def _new(self) -> None:
+        if not self.maybe_save():
+            return
         m = MachineProfile(name=f"Machine {len(self.machines) + 1}")
         self.machines.append(m)
         self.store.save(m)
+        self._unsaved_new.add(m.machine_id)
         self._refresh_list(m.machine_id)
         self.machinesChanged.emit()
+        self.name.setFocus()
+        self.name.selectAll()
 
     def _remove(self) -> None:
         m = self.current_machine()
         if m is None:
             return
+        answer = QMessageBox.question(
+            self, "Remove machine", f"Remove {m.name} from the inventory? Projects keep their own copy.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._dirty = False
         self.store.delete(m.machine_id)
         self.machines = self.store.list()
         self._refresh_list()
@@ -634,9 +847,11 @@ class MachinesTab(QWidget):
 class SoftLimitWizard(QDialog):
     """Record hard limits from the current machine position and set soft margins per axis and direction."""
 
-    def __init__(self, machine: MachineProfile, gates, tools: list, position_provider, parent=None) -> None:
+    def __init__(self, machine: MachineProfile, gates, tools: list, position_provider, parent=None,
+                 pad=None, kill=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Soft limits · {machine.name}")
+        self.pad = pad  # v3 Block 9: the jog pad (same guarded jogs as the machine panel)
         self.machine = machine
         self.gates = gates
         self.tools = tools
@@ -685,6 +900,14 @@ class SoftLimitWizard(QDialog):
                 grid.addRow(f"{axis} {side}", row)
                 self.rows[(axis, side)] = {"label": label, "margin": margin, "released": released}
         layout.addWidget(grid_box)
+        if pad is not None:
+            layout.addWidget(pad)
+        elif kill is not None:
+            kill_button = QPushButton("KILL")
+            kill_button.setToolTip("Feed hold, soft reset, spindle and beam off.")
+            kill_button.setAutoDefault(False)
+            kill_button.clicked.connect(kill)
+            layout.addWidget(kill_button)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
@@ -723,28 +946,62 @@ class SoftLimitWizard(QDialog):
 class PreflightDialog(QDialog):
     """Move each axis through its travel and tick it; motion stays disabled until every axis is ticked."""
 
-    def __init__(self, machine: MachineProfile | None, axes: str = "XYZ", parent=None) -> None:
+    def __init__(self, machine: MachineProfile | None, axes: str = "XYZ", parent=None, pad=None,
+                 actions: dict | None = None) -> None:
+        """``pad``: the host's jog pad (preflight jogs); ``actions``: home / unlock / hold / kill callables.
+        With a pad, an axis's tick is offered once it has moved both ways during this preflight."""
         super().__init__(parent)
         self.setWindowTitle("Preflight check")
+        self.setObjectName("preflightWindow")
         self.machine = machine
         self.wants_soft_limit_setup = False
+        self.pad = pad
+        self.moved: dict[str, set[int]] = {a: set() for a in axes}
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Before motion is enabled, move each axis through its full travel and confirm it moves freely. "
-            "Tick each axis when done. Jog controls stay limited to preflight until every axis is ticked."
+            "Before motion is enabled, move each axis through its full travel with the arrows below and "
+            "confirm it moves freely. Tick each axis when done. Until then only these preflight jogs work."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
+        grid = QGridLayout()
         self.boxes: dict[str, QCheckBox] = {}
-        for axis in axes:
+        self.position_labels: dict[str, QLabel] = {}
+        self.pin_labels: dict[str, QLabel] = {}
+        for row, axis in enumerate(axes):
             box = QCheckBox(f"{axis} axis moved through its travel")
             box.toggled.connect(self._update)
-            layout.addWidget(box)
+            if pad is not None:
+                box.setEnabled(False)
+                box.setToolTip("Move this axis both ways first.")
+            self.position_labels[axis] = QLabel("-")
+            self.pin_labels[axis] = QLabel("")
+            grid.addWidget(box, row, 0)
+            grid.addWidget(self.position_labels[axis], row, 1)
+            grid.addWidget(self.pin_labels[axis], row, 2)
             self.boxes[axis] = box
+        layout.addLayout(grid)
+        self.action_buttons: dict[str, QPushButton] = {}
+        if actions:
+            row = QHBoxLayout()
+            for key, text in (("home", "Home"), ("unlock", "Unlock ($X)"), ("hold", "Feed hold"), ("kill", "KILL")):
+                if key not in actions:
+                    continue
+                button = QPushButton(text)
+                button.setAutoDefault(False)
+                button.clicked.connect(lambda _c=False, f=actions[key]: f())
+                if key == "kill":
+                    row.addSpacing(16)  # set apart from the other buttons
+                    button.setToolTip("Feed hold, soft reset, spindle and beam off.")
+                row.addWidget(button)
+                self.action_buttons[key] = button
+            layout.addLayout(row)
+        if pad is not None:
+            layout.addWidget(pad, 1)
         self.soft_hint = QLabel("")
         self.soft_hint.setWordWrap(True)
         layout.addWidget(self.soft_hint)
-        self.setup_soft = QCheckBox("Lead me through setting soft limits after this")
+        self.setup_soft = QCheckBox("Set up soft limits after this")
         layout.addWidget(self.setup_soft)
         if machine is None or not machine.has_soft_limits():
             self.soft_hint.setText("No soft limits are set for this machine. Setting them is recommended.")
@@ -759,6 +1016,29 @@ class PreflightDialog(QDialog):
 
     def is_complete(self) -> bool:
         return all(box.isChecked() for box in self.boxes.values())
+
+    def note_move(self, axis: str, sign: int) -> None:
+        """A preflight jog was sent; both directions offer the axis's tick."""
+        axis = axis.upper()
+        if axis not in self.moved:
+            return
+        self.moved[axis].add(1 if sign > 0 else -1)
+        if self.moved[axis] == {1, -1}:
+            self.boxes[axis].setEnabled(True)
+            self.boxes[axis].setToolTip("")
+
+    def update_status(self, positions: dict, pins: str = "", enabled: dict | None = None) -> None:
+        """Live machine position and limit inputs per axis; which action buttons may be pressed."""
+        for axis, label in self.position_labels.items():
+            value = positions.get(axis)
+            label.setText("-" if value is None else f"{value:.3f}")
+        active = str(pins or "").upper()
+        for axis, label in self.pin_labels.items():
+            label.setText("limit ON" if axis in active else "")
+        for key, allowed in (enabled or {}).items():
+            button = self.action_buttons.get(key)
+            if button is not None:
+                button.setEnabled(bool(allowed))
 
     def _update(self) -> None:
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(self.is_complete())

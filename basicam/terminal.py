@@ -19,6 +19,7 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, Qt, Signal
 
+from basicam.grbl_handshake import refused_setting
 from basicam.theme import TOKENS
 from PySide6.QtGui import QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
@@ -223,6 +224,9 @@ class CommandValidator:
             )
         if not connected:
             return ValidationResult("refuse", text, "No machine connected; nothing was sent.")
+        refusal = refused_setting(text)  # $21=0 / $20=0 never; $5 only in the limit-switch test (v3 Block 7)
+        if refusal:
+            return ValidationResult("refuse", text, refusal)
         moves = is_motion_command(text)
         if moves:
             if not position_verified and not text.upper().startswith("$H"):

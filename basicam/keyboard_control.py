@@ -60,7 +60,11 @@ class KeyboardMachineControl:
         self.pending: MoveRequest | None = None
 
     # -------------------------------------------------------------------
-    def step_mm(self, shift: bool = False, ctrl: bool = False) -> float:
+    def step_mm(self, shift: bool = False, ctrl: bool = False, axis: str | None = None) -> float:
+        step_for = getattr(self, "step_for", None)  # v3 Block 9: the jog pad's increment for this axis
+        if step_for is not None and axis:
+            base = float(step_for(axis))
+            return base * 10.0 if shift else (base / 10.0 if ctrl else base)
         size = "fine" if ctrl else ("large" if shift else "medium")
         return STEPS_IN[size] * 25.4 if self.inches else STEPS_MM[size]
 
@@ -92,7 +96,7 @@ class KeyboardMachineControl:
         if self.state is KState.IDLE:
             if key in DIRECT:
                 axis, direction = DIRECT[key]
-                return KeyResult("send", self._request(axis, direction * self.step_mm(shift, ctrl)), "Keyboard jog")
+                return KeyResult("send", self._request(axis, direction * self.step_mm(shift, ctrl, axis)), "Keyboard jog")
             if key.upper() in ("X", "Y", "Z"):
                 self.state, self.axis = KState.AXIS_CHOSEN, key.upper()
                 return KeyResult("status", message=self.prompt())

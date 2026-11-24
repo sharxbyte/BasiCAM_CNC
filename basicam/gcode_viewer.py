@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from basicam.cam_features import GrblModalState
 from basicam.motion_guard import GuardState, interpret_line
+from basicam.window_fit import make_working_window
 
 OPERATION_HEADER = re.compile(r"^\s*;\s*Operation:\s*(?P<name>.+?)(?:\s+·\s+Tool:\s*(?P<tool>.+?))?\s*$")
 
@@ -311,6 +312,7 @@ class AdvancedEditorWindow(QDialog):
         super().__init__(host)
         self.host = host
         self.setWindowTitle("Advanced G-code")
+        make_working_window(self)
         self.resize(900, 700)
         self.source = source
         self.edited = False
