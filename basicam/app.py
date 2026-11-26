@@ -79,6 +79,7 @@ from basicam.importers import (
 from basicam.materials import MaterialStore
 from basicam.machine_profiles import RotaryDeviceDialog
 from basicam.tool_changer import ToolChanger, ToolTable, tool_change_block, tools_not_loaded
+from basicam.about import APP_VERSION, show_terms_dialog
 from basicam.auxiliaries import AUX_KINDS, AuxOutput, aux_lines, default_aux_for, missing_required
 from basicam.usage_tracking import ITEMS as USAGE_ITEMS, JobUsage, UsageStore, format_usage, usage_from_program
 from basicam.sketch_interaction import (
@@ -2109,6 +2110,9 @@ class BasiCAMWindow(CamWorkspaceTabsMixin, WorkspaceBundleMixin, QMainWindow):
             lambda: QDesktopServices.openUrl(QUrl("https://github.com/sharxbyte/BasiCAM_CNC"))
         )
         help_menu.addAction(repo_action)
+        terms_action = QAction("Terms of Use and License...", self)
+        terms_action.triggered.connect(lambda: setattr(self, "_terms_dialog", show_terms_dialog(self)))
+        help_menu.addAction(terms_action)
         file_menu.addSeparator()
 
         self.open_bcam_action.setShortcut(QKeySequence("Ctrl+Alt+O"))
@@ -12258,6 +12262,7 @@ def main() -> int:
     pv.set_plot_theme("dark")
     app = QApplication(sys.argv)
     app.setApplicationName("BasiCAM CNC")
+    app.setApplicationVersion(APP_VERSION)
     icon_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
     icon_path = icon_root / "BCCIcon.ico"
     if icon_path.exists():

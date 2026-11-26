@@ -4,10 +4,13 @@ Desktop CAD/CAM with GRBL machine control, for Windows and Linux.
 
 Source: <https://github.com/sharxbyte/BasiCAM_CNC>
 
+Free software under the GNU General Public License v3.0 or later: free for hobby and commercial use,
+at your own risk. See [Terms of use](TERMS_OF_USE.md) and [License](LICENSE).
+
 ## Development status
 
-- Version: 0.24.0 pre-release (2026-11-24). Roadmaps v1 (13 blocks), v2 (23 blocks) and v3 (11 pre-release fixes) complete.
-- Last change: X / Y travel limits apply to the axis position; the tool outline moves with the tool and may never touch keep-outs or fixtures (jigs, clamps), and only its cutting length may cut stock. Fixed the start-up crash when restoring the last session after an unclean exit. An unnamed project takes the name of the part opened. 227 tests.
+- Version: 1.0.0 (2026-11-25), first full release. Roadmaps v1 (13 blocks), v2 (23 blocks) and v3 (11 pre-release fixes) complete.
+- Last change: licensed GPL-3.0-or-later with plain-English terms of use (**File > Help > Terms of Use and License**); Windows build moved from PyInstaller one-file to a Nuitka one-folder build; CI build prepared for SignPath Foundation code signing (releases unsigned until approved).
 - Open items: none from the roadmap. Quarantined: none.
 - **Not yet run against a real machine.** Use `docs/hardware_test.md` for the first session and verify all generated G-code independently.
 
@@ -37,8 +40,8 @@ Streamed over USB serial: GRBL 1.1 (3 axes), grblHAL and FluidNC (up to 6 axes; 
 ## Requirements
 
 - Python 3.11 or newer.
-- `requirements.txt`: PySide6, pyvista, pyvistaqt, vtk, numpy, trimesh, ezdxf, cadquery-ocp, python-solvespace, shapely, pyserial, pyinstaller, pyvista-cad; pywin32 on Windows.
-- `python-solvespace` is GPLv3. Distributing a build that bundles it brings GPL obligations.
+- `requirements.txt`: PySide6, pyvista, pyvistaqt, vtk, numpy, trimesh, ezdxf, cadquery-ocp, python-solvespace, shapely, pyserial, pyvista-cad; pywin32 on Windows; Nuitka (with ordered-set and zstandard) to build the Windows program.
+- `python-solvespace` is GPLv3, which is one reason BasiCAM CNC as a whole is GPL-3.0-or-later. Other components and their licenses: `THIRD_PARTY_NOTICES.md`.
 - DWG import needs the free ODA File Converter; set its path in **Options > Preferences > DWG converter**.
 
 ## Run from source
@@ -63,15 +66,21 @@ python -m pip install -r requirements.txt
 python -m basicam
 ```
 
-## Build a Windows executable
+## Build the Windows program
 
-From PowerShell in the project folder, with the virtual environment active:
+Nuitka compiles the program to C and builds it with Microsoft Visual C++ (install Visual Studio or the
+Build Tools with "Desktop development with C++"). From PowerShell in the project folder:
 
 ```powershell
-pyinstaller --noconfirm --clean BasiCAM_CNC.spec
+.uild_windows.ps1          # dist\BasiCAM CNC\BasiCAM CNC.exe and its files, in one folder
+.uild_windows.ps1 -Zip     # also dist\BasiCAM-CNC-<version>-windows-x64.zip for a release
+.uild_windows.ps1 -Diagnostic   # with a console window that shows start-up errors
 ```
 
-The one-file, windowed build is written to `dist\BasiCAM CNC.exe`. For a console build that shows start-up errors, set `$env:BASICAM_DIAGNOSTIC = "1"` before running PyInstaller (produces `dist\BasiCAM CNC Diagnostic.exe`). Builds only run on the OS they were built on. Some antivirus products flag unsigned one-file executables; see `ThisIsNotMalware.txt`.
+The program is a folder, not a single exe: keep `BasiCAM CNC.exe` together with the files beside it
+(copy or zip the whole `BasiCAM CNC` folder). The first build takes a long time (often an hour or more);
+later builds reuse Nuitka's cache. GitHub Actions builds the same folder with `build_nuitka.py`
+(`.github/workflows/build.yml`).
 
 ## Safety switches and Beginner mode
 
@@ -112,3 +121,36 @@ Connect in the Machine dock, wait for GRBL identification, complete the prefligh
 ## Safety note
 
 Generated G-code, previews, simulation, collision checks and feeds/speeds values are aids, not guarantees. Verify toolpaths, tooling, fixturing and machine setup independently before running anything on a machine.
+
+## License and terms of use
+
+BasiCAM CNC is free software: you can redistribute it and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation, either version 3 of the License,
+or (at your option) any later version. It is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+PURPOSE. See `LICENSE` for the full text.
+
+In plain English (`TERMS_OF_USE.md`): use it for free for hobby or commercial work, sell what you make
+with it, copy and change it; if you distribute a changed version, share its source under the same
+license. You use it at your own risk.
+
+## Code signing policy
+
+Windows releases are currently **unsigned**; Windows SmartScreen may warn the first time you start
+the program (see `ThisIsNotMalware.txt`). Signing through the SignPath Foundation has been prepared;
+once approved, releases will carry: *Free code signing provided by [SignPath.io](https://signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).*
+
+- Only the program this repository builds (`BasiCAM CNC.exe`) is signed, and only from the GitHub
+  Actions build of this public repository; third-party files are never signed by this project.
+- Committers and reviewers: [the repository's contributors](https://github.com/sharxbyte/BasiCAM_CNC/graphs/contributors).
+- Approvers: [the repository owner](https://github.com/sharxbyte). Every signing request is approved by hand.
+
+Maintainer steps: `docs/code_signing.md`.
+
+## Privacy policy
+
+This program will not transfer any information to other networked systems unless specifically
+requested by the user or the person installing or operating it. It talks only to the machine
+controller you connect over the serial port; the GitHub and Donate links open in your web browser
+only when you click them.

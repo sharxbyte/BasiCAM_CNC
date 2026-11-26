@@ -149,6 +149,14 @@ class FirstRunDialog(QDialog):
         )
         info.setWordWrap(True)
         layout.addWidget(info)
+        terms = QLabel(
+            "BasiCAM CNC is free for hobby and commercial use (GPL-3.0-or-later). It comes with no "
+            "warranty: you use it at your own risk and must check every toolpath before running it. "
+            "See File > Help > Terms of Use and License."
+        )
+        terms.setWordWrap(True)
+        terms.setObjectName("firstRunTerms")
+        layout.addWidget(terms)
         self.dont_ask = QCheckBox("Don't ask again")
         self.dont_ask.setToolTip("Skip this question at the next start-up.")
         layout.addWidget(self.dont_ask)

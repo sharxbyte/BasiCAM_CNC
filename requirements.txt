@@ -27,8 +27,11 @@ pyserial>=3.5
 # SLDPRT conversion via an installed, licensed SolidWorks (Windows only)
 pywin32>=306; sys_platform == "win32"
 
-# Building the executable
-pyinstaller>=6.6
+# Building the executable (Nuitka, one-folder build; needs MSVC on Windows)
+nuitka>=4.0
+ordered-set>=4.1
+zstandard>=0.22
+pillow>=10.0  # converts the PNG app icon to a Windows .ico at build time
 
 # Optional: extra CAD view helpers. The app runs without it (guarded import).
 pyvista-cad

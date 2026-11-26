@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for BasiCAM CNC (paste into the SignPath project).
+  The GitHub artifact is the contents of dist/BasiCAM CNC/ zipped by actions/upload-artifact,
+  so the program sits at the root. Only BasiCAM's own exe is signed; third-party DLLs and
+  Python extension modules are left as their projects ship them (SignPath Foundation policy).
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="BasiCAM CNC.exe" product-name="BasiCAM CNC">
+      <authenticode-sign/>
+    </pe-file>
+  </zip-file>
+</artifact-configuration>
